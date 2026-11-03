@@ -195,3 +195,4 @@ def downgrade() -> None:
     op.drop_table("history")
     op.drop_index("ix_records_tbl", table_name="records")
     op.drop_table("records")
+

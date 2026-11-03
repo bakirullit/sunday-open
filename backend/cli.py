@@ -112,3 +112,4 @@ def setup_bot_cli() -> None:
 
 if __name__ == "__main__":
     setup_bot_cli()
+

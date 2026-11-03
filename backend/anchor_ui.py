@@ -688,3 +688,4 @@ def create_default_navigator(
 
 default_navigator = create_default_navigator()
 bot_router = Router(name="sunday_open_anchor_router")
+

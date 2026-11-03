@@ -180,3 +180,4 @@ class KeyValue(Base):
 
     key: Mapped[str] = mapped_column(String(120), primary_key=True)
     value: Mapped[str] = mapped_column(Text, nullable=False, default="")
+

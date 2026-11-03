@@ -39,3 +39,4 @@ setup-bot = "backend.cli:setup_bot_cli"
 asyncio_mode = "auto"
 testpaths = ["backend/tests"]
 python_files = ["test_*.py"]
+
