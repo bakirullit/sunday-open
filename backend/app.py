@@ -1,12 +1,25 @@
 import json
 from typing import Any
-from fastapi import Depends, FastAPI, Request, Response
+from fastapi import Depends, FastAPI, Form, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, RedirectResponse
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.ai import handle_ai_proxy
 from backend.config import settings
 from backend.database import get_session
+from backend.models import Proposal
+from backend.moderation import (
+    compute_proposal_diff,
+    create_admin_token,
+    notify_moderators_on_propose,
+    render_admin_html,
+    review_proposal,
+    send_email_async,
+    verify_admin_token,
+    verify_moderator_email,
+)
 from backend.sync import apply_operation, propose_operation, read_all_data
 
 app = FastAPI(title="Sunday Open Backend", version="1.0.0")
@@ -68,9 +81,132 @@ async def do_post(
     try:
         async with session.begin():
             if protocol == 4:
-                result = await propose_operation(session, pre)
+                result = await propose_operation(
+                    session,
+                    pre,
+                    notify_mods_fn=notify_moderators_on_propose,
+                )
             else:
                 result = await apply_operation(session, pre)
         return json_response(result)
     except Exception as exc:
         return json_response({"protocol": protocol, "ok": False, "error": str(exc)})
+
+
+def _resolve_admin_email(request: Request, token: str | None = None) -> str:
+    candidate = (
+        token
+        or request.query_params.get("token")
+        or request.cookies.get("sunday_admin_token")
+        or request.headers.get("X-Admin-Token")
+    )
+    email = verify_admin_token(candidate)
+    if not email:
+        raise HTTPException(
+            status_code=403,
+            detail="Only a configured moderator with a verified Google account can review changes",
+        )
+    return email
+
+
+@app.post("/admin/login")
+async def admin_login(email: str = Form(...)) -> dict[str, Any]:
+    try:
+        clean = verify_moderator_email(email)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+    token = create_admin_token(clean)
+    base = (settings.PUBLIC_BASE_URL or "http://localhost:8000").rstrip("/")
+    magic_link = f"{base}/admin?token={token}"
+    if settings.SMTP_HOST:
+        await send_email_async(
+            clean,
+            "Sunday Open: вход в панель модератора",
+            f"Ссылка для входа в очередь одобрения:\n{magic_link}",
+        )
+    return {"ok": True, "email": clean, "magic_link": magic_link}
+
+
+@app.get("/admin")
+async def admin_queue(
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    email = _resolve_admin_email(request)
+    token = (
+        request.query_params.get("token")
+        or request.cookies.get("sunday_admin_token")
+        or create_admin_token(email)
+    )
+    stmt = (
+        select(Proposal)
+        .where(Proposal.status == "pending")
+        .order_by(Proposal.created_at.asc())
+    )
+    proposals = list((await session.execute(stmt)).scalars().all())
+
+    if "application/json" in (request.headers.get("accept") or ""):
+        return json_response(
+            {
+                "ok": True,
+                "moderator": email,
+                "proposals": [
+                    {
+                        "mutationId": p.mutation_id,
+                        "table": p.tbl,
+                        "id": p.id,
+                        "baseVersion": p.base_version,
+                        "isDelete": p.is_delete,
+                        "status": p.status,
+                        "diff": compute_proposal_diff(p),
+                    }
+                    for p in proposals
+                ],
+            }
+        )
+
+    html_content = render_admin_html(email, proposals, token)
+    resp = HTMLResponse(content=html_content, status_code=200)
+    resp.set_cookie(
+        "sunday_admin_token", token, httponly=True, samesite="lax", max_age=86400
+    )
+    return resp
+
+
+@app.post("/admin/review")
+async def admin_review_action(
+    request: Request,
+    mutation_id: str = Form(...),
+    action: str = Form(...),
+    token: str | None = Form(None),
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    email = _resolve_admin_email(request, token=token)
+    approve = action == "approve"
+    try:
+        async with session.begin():
+            res = await review_proposal(
+                session=session,
+                proposal_ref=mutation_id,
+                approve=approve,
+                reviewer=email,
+            )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if "application/json" in (request.headers.get("accept") or ""):
+        return json_response(
+            {
+                "ok": True,
+                "mutationId": mutation_id,
+                "status": res["status"],
+                "changed": res["changed"],
+                "reviewedBy": email,
+            }
+        )
+
+    active_token = token or create_admin_token(email)
+    return RedirectResponse(url=f"/admin?token={active_token}", status_code=303)
