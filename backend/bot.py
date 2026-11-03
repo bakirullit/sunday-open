@@ -1245,6 +1245,23 @@ async def handle_tg_message(
             send_msg_fn=sender,
         )
 
+    if cmd_name == "menu":
+        from backend.anchor_ui import create_default_navigator
+
+        nav = create_default_navigator(state_store=state_store)
+        await upsert_bot_user(session, from_user)
+        await nav.reset_history(from_user["id"], session=session)
+        return await nav.navigate(
+            session=session,
+            user_id=from_user["id"],
+            chat_id=chat_id,
+            screen_id="home",
+            payload={},
+            push_to_history=True,
+            force_new_message=True,
+            send_msg_fn=sender,
+        )
+
     if cmd_name in ("start", "help"):
         await upsert_bot_user(session, from_user)
         help_text = (
@@ -1388,6 +1405,79 @@ async def handle_tg_callback(
                 "text": f"{orig_text}\n\n{suffix}",
             },
         )
+
+    # Anchor UI LIFO navigation callbacks (nav:back, nav:home, nav:open:*, nav:stage:*, nav:card:*)
+    if data.startswith("nav:"):
+        from backend.anchor_ui import create_default_navigator
+
+        nav = create_default_navigator(state_store=state_store)
+        uid = from_user.get("id")
+        if data == "nav:back":
+            await nav.back(
+                session=session,
+                user_id=uid,
+                chat_id=chat_id,
+                anchor_message_id=message_id,
+                send_msg_fn=sender,
+                send_api_fn=api_caller,
+            )
+            return await answer()
+        if data == "nav:home":
+            await nav.reset_history(uid, session=session)
+            await nav.navigate(
+                session=session,
+                user_id=uid,
+                chat_id=chat_id,
+                screen_id="home",
+                payload={},
+                push_to_history=True,
+                anchor_message_id=message_id,
+                send_msg_fn=sender,
+                send_api_fn=api_caller,
+            )
+            return await answer()
+        if data.startswith("nav:open:"):
+            target_screen = data[len("nav:open:") :]
+            await nav.navigate(
+                session=session,
+                user_id=uid,
+                chat_id=chat_id,
+                screen_id=target_screen,
+                payload={},
+                push_to_history=True,
+                anchor_message_id=message_id,
+                send_msg_fn=sender,
+                send_api_fn=api_caller,
+            )
+            return await answer()
+        if data.startswith("nav:stage:"):
+            stage_name = data[len("nav:stage:") :]
+            await nav.navigate(
+                session=session,
+                user_id=uid,
+                chat_id=chat_id,
+                screen_id="ideas_stage",
+                payload={"stage": stage_name},
+                push_to_history=True,
+                anchor_message_id=message_id,
+                send_msg_fn=sender,
+                send_api_fn=api_caller,
+            )
+            return await answer()
+        if data.startswith("nav:card:"):
+            card_id = data[len("nav:card:") :]
+            await nav.navigate(
+                session=session,
+                user_id=uid,
+                chat_id=chat_id,
+                screen_id="idea_detail",
+                payload={"card_id": card_id},
+                push_to_history=True,
+                anchor_message_id=message_id,
+                send_msg_fn=sender,
+                send_api_fn=api_caller,
+            )
+            return await answer()
 
     # Role selection in /register (g:0, g:1, g:2)
     if re.match(r"^g:\d$", data):
