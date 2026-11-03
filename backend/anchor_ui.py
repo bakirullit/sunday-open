@@ -22,15 +22,17 @@ from backend.bot import (
     get_missing_profile_fields,
     get_portal_rows,
 )
-from backend.models import Contact
+from backend.models import BotUser, Contact, Proposal
 from backend.moderation import (
     TG_LABELS,
     get_kv,
+    is_tg_moderator,
     send_tg_api,
     send_tg_message,
-     set_kv,
+    set_kv,
     tg_cut,
     tg_date_fmt,
+    tg_days_from_today,
     tg_esc,
     tg_webapp_button,
     tg_webapp_kb,
@@ -427,31 +429,39 @@ async def render_home_screen(
     _chat_id: int | str,
     _payload: dict[str, Any],
 ) -> Screen:
+    bot_user = (
+        await session.execute(
+            select(BotUser).where(BotUser.tg_id == str(user_id))
+        )
+    ).scalar_one_or_none()
+    reminders_on = bool(bot_user.reminders) if bot_user else True
+    rem_status = "🔔 Напоминания: Вкл" if reminders_on else "🔕 Напоминания: Выкл"
+
     text = (
         "<b>Sunday Open · Проекты</b>\n\n"
-        "Здесь клубы подают идеи, заполняют паспорт проекта и смотрят календарь. "
-        "Правки сначала смотрит штаб, я напишу, когда их одобрят.\n\n"
-        "/register — регистрация клуба и контакты\n"
-        "/new — подать идею прямо в чате\n"
-        "/ideas — банк идей\n"
-        "/calendar — ближайшие события\n"
-        "/remind — включить или выключить напоминания\n"
-        "/list — списки участников (организаторам)\n"
-        "/cancel — прервать подачу идеи или регистрацию"
+        "Интерактивное меню управления проектами, идеями и событиями.\n"
+        "Выберите действие кнопками ниже:"
     )
     rows: list[list[dict[str, Any]]] = [
         [
-            {"text": "💡 Банк идей", "callback_data": "nav:open:ideas"},
-            {"text": "📅 Календарь", "callback_data": "nav:open:calendar"},
+            {"text": "💡 Подать идею", "callback_data": "act:new_idea"},
+            {"text": "📚 Банк идей", "callback_data": "nav:open:ideas"},
         ],
         [
+            {"text": "📅 Календарь", "callback_data": "nav:open:calendar"},
             {"text": "👤 Профиль", "callback_data": "nav:open:profile"},
+        ],
+        [
             {"text": "📋 Списки", "callback_data": "nav:open:list"},
+            {"text": rem_status, "callback_data": "act:toggle_remind"},
         ],
     ]
-    webapp_btn = tg_webapp_button("Открыть портал")
+    if await is_tg_moderator(session, user_id):
+        rows.append([{"text": "🛡 Очередь модерации", "callback_data": "nav:open:moderation"}])
+
+    webapp_btn = tg_webapp_button("🌐 Открыть портал")
     if webapp_btn:
-        rows.insert(0, [webapp_btn])
+        rows.append([webapp_btn])
     return Screen(
         text=text,
         reply_markup={"inline_keyboard": rows},
@@ -467,9 +477,12 @@ async def render_ideas_screen(
 ) -> Screen:
     portal_rows = await get_portal_rows(session)
     text, base_kb = format_ideas_text(portal_rows)
-    kb_rows: list[list[dict[str, Any]]] = []
+    kb_rows: list[list[dict[str, Any]]] = [
+        [{"text": "💡 Подать новую идею", "callback_data": "act:new_idea"}]
+    ]
     if base_kb and isinstance(base_kb.get("inline_keyboard"), list):
-        kb_rows.extend(base_kb["inline_keyboard"])
+        for r in base_kb["inline_keyboard"]:
+            kb_rows.append(r)
 
     stages_present = [
         st
@@ -585,9 +598,32 @@ async def render_calendar_screen(
     today_iso = payload.get("today_iso")
     portal_rows = await get_portal_rows(session)
     text, base_kb = format_calendar_text(portal_rows, today_iso=today_iso)
+    kb_rows: list[list[dict[str, Any]]] = []
+
+    upcoming = [
+        r
+        for r in portal_rows
+        if r.get("date")
+        and r.get("stage") not in ("Отклонена", "Закрыт")
+        and tg_days_from_today(str(r["date"]), today_iso=today_iso) >= 0
+    ]
+    upcoming.sort(key=lambda r: str(r.get("date") or ""))
+    for r in upcoming[:8]:
+        card_id = str(r.get("_id") or "")
+        title = r.get("title") or "Событие"
+        d_fmt = tg_date_fmt(r.get("date"))[:5]
+        if card_id:
+            kb_rows.append([
+                {"text": f"📄 {d_fmt} · {tg_cut(title, 26)}", "callback_data": f"nav:card:{card_id[:48]}"}
+            ])
+
+    if base_kb and isinstance(base_kb.get("inline_keyboard"), list):
+        for r in base_kb["inline_keyboard"]:
+            kb_rows.append(r)
+
     return Screen(
         text=text,
-        reply_markup=base_kb or {"inline_keyboard": []},
+        reply_markup={"inline_keyboard": kb_rows},
         title="📅 Календарь",
     )
 
@@ -603,13 +639,26 @@ async def render_profile_screen(
             select(Contact).where(Contact.tg_id == str(user_id))
         )
     ).scalar_one_or_none()
+    bot_user = (
+        await session.execute(
+            select(BotUser).where(BotUser.tg_id == str(user_id))
+        )
+    ).scalar_one_or_none()
+    reminders_on = bool(bot_user.reminders) if bot_user else True
+    rem_status = "🔔 Напоминания: Вкл" if reminders_on else "🔕 Напоминания: Выкл"
+
     p = contact_to_profile(contact)
     miss = get_missing_profile_fields(p)
     if not contact:
         text = (
             "<b>Профиль участника</b>\n\n"
-            "Вы ещё не зарегистрированы. Нажмите /register или откройте профиль в портале."
+            "Вы ещё не зарегистрированы в клубе.\n"
+            "Нажмите «📱 Зарегистрироваться» ниже для быстрой привязки контакта."
         )
+        kb_rows = [
+            [{"text": "📱 Зарегистрироваться", "callback_data": "act:register"}],
+            [{"text": rem_status, "callback_data": "act:toggle_remind"}],
+        ]
     else:
         status_str = (
             f"⚠️ Не заполнено: {', '.join(miss)}"
@@ -624,8 +673,11 @@ async def render_profile_screen(
             f"<b>Телефон:</b> {tg_esc(p.get('phone') or '—')}\n"
             f"<b>Email:</b> {tg_esc(p.get('email') or '—')}"
         )
-    kb_rows: list[list[dict[str, Any]]] = []
-    btn = tg_webapp_button("Открыть профиль", "tab=me")
+        kb_rows = [
+            [{"text": "✏️ Изменить профиль", "callback_data": "act:register"}],
+            [{"text": rem_status, "callback_data": "act:toggle_remind"}],
+        ]
+    btn = tg_webapp_button("🌐 Открыть профиль в портале", "tab=me")
     if btn:
         kb_rows.append([btn])
     return Screen(
@@ -646,8 +698,9 @@ async def render_list_screen(
     )
     if not evs:
         text = (
-            "Списков пока нет. Команда работает для штаба и для организаторов клуба "
-            "(роль «Организатор» в /register), когда на события клуба кто-то записался."
+            "<b>Списки участников</b>\n\n"
+            "Списков пока нет. Раздел доступен организаторам клубов "
+            "и штабу, когда на события вашего клуба регистрируются участники."
         )
         return Screen(
             text=text,
@@ -657,7 +710,7 @@ async def render_list_screen(
     inline_rows = [
         [
             {
-                "text": f"{tg_date_fmt(e['date'])[:5]} · {tg_cut(e['title'], 34)} · {e['going']}"
+                "text": f"📥 {tg_date_fmt(e['date'])[:5]} · {tg_cut(e['title'], 30)} · {e['going']}"
                 + (f" (пришли {e['inside']})" if e["inside"] else ""),
                 "callback_data": f"l:{e['id'][:60]}",
             }
@@ -665,9 +718,59 @@ async def render_list_screen(
         for e in evs[:20]
     ]
     return Screen(
-        text="<b>Списки участников</b>\nНажмите на событие, пришлю таблицу CSV (открывается в Excel и Google Таблицах).",
+        text="<b>Списки участников</b>\nНажмите на событие, чтобы скачать таблицу CSV (Excel):",
         reply_markup={"inline_keyboard": inline_rows},
         title="📋 Списки",
+    )
+
+
+async def render_moderation_screen(
+    session: AsyncSession,
+    user_id: int | str,
+    _chat_id: int | str,
+    _payload: dict[str, Any],
+) -> Screen:
+    if not await is_tg_moderator(session, user_id):
+        return Screen(
+            text="Раздел доступен только модераторам.",
+            reply_markup={"inline_keyboard": []},
+            title="🛡 Модерация",
+        )
+    proposals = (
+        await session.execute(
+            select(Proposal)
+            .where(Proposal.status == "pending")
+            .order_by(Proposal.created_at.desc())
+            .limit(10)
+        )
+    ).scalars().all()
+
+    if not proposals:
+        return Screen(
+            text="<b>🛡 Очередь модерации</b>\n\nВсе заявки рассмотрены! Новых правок нет. 🎉",
+            reply_markup={"inline_keyboard": []},
+            title="🛡 Модерация",
+        )
+
+    lines = [f"<b>🛡 Очередь модерации</b> · {len(proposals)} на рассмотрении:\n"]
+    kb_rows: list[list[dict[str, Any]]] = []
+    for p in proposals:
+        op = p.payload or {}
+        row = op.get("row") or {}
+        title = row.get("title") or p.ref
+        is_del = bool(op.get("del"))
+        action_kind = "удаление" if is_del else ("новая" if p.op_hash else "правка")
+        lines.append(f"• <b>{tg_esc(title)}</b> ({action_kind})")
+        cb_suffix = f"{p.ref}:{p.op_hash[:10]}"
+        kb_rows.append([
+            {"text": f"✅ {tg_cut(title, 20)}", "callback_data": f"a:{cb_suffix}"},
+            {"text": "❌ Отклонить", "callback_data": f"r:{cb_suffix}"},
+        ])
+
+    return Screen(
+        text="\n".join(lines),
+        reply_markup={"inline_keyboard": kb_rows},
+        title="🛡 Модерация",
     )
 
 
@@ -683,6 +786,7 @@ def create_default_navigator(
     nav.register_screen("calendar", "📅 Календарь", render_calendar_screen)
     nav.register_screen("profile", "👤 Профиль", render_profile_screen)
     nav.register_screen("list", "📋 Списки", render_list_screen)
+    nav.register_screen("moderation", "🛡 Модерация", render_moderation_screen)
     return nav
 
 
