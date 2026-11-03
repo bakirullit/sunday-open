@@ -144,6 +144,34 @@ async def is_tg_moderator(session: AsyncSession, user_id: int | str) -> bool:
     return any(str(m.get("id")) == str(user_id) for m in mods)
 
 
+_shared_tg_client: httpx.AsyncClient | None = None
+_shared_tg_loop_id: int | None = None
+
+
+def _get_shared_tg_client() -> httpx.AsyncClient:
+    """Return a keep-alive pooled httpx.AsyncClient bound to the current event loop."""
+    global _shared_tg_client, _shared_tg_loop_id
+    try:
+        loop_id = id(asyncio.get_running_loop())
+    except RuntimeError:
+        loop_id = None
+    if (
+        _shared_tg_client is None
+        or _shared_tg_client.is_closed
+        or _shared_tg_loop_id != loop_id
+    ):
+        _shared_tg_client = httpx.AsyncClient(
+            timeout=15.0,
+            limits=httpx.Limits(
+                max_keepalive_connections=20,
+                max_connections=50,
+                keepalive_expiry=60.0,
+            ),
+        )
+        _shared_tg_loop_id = loop_id
+    return _shared_tg_client
+
+
 async def send_tg_api(
     method: str,
     payload: dict[str, Any],
@@ -155,11 +183,8 @@ async def send_tg_api(
         return None
     url = f"https://api.telegram.org/bot{token}/{method}"
     try:
-        if http_client is not None:
-            resp = await http_client.post(url, json=payload, timeout=15.0)
-        else:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.post(url, json=payload)
+        client = http_client or _get_shared_tg_client()
+        resp = await client.post(url, json=payload, timeout=15.0)
         return resp.json()
     except Exception:
         return None

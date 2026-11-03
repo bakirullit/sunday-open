@@ -56,45 +56,46 @@ async def dispatch_tg_update(
 async def init_bot_profile(token: str) -> None:
     """Initialize bot commands, menu button, and kv state matching setupSundayBot."""
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            me_res = await client.get(f"https://api.telegram.org/bot{token}/getMe")
-            if me_res.status_code == 200:
-                me_data = me_res.json().get("result", {})
-                username = me_data.get("username", "")
-                first_name = me_data.get("first_name", "")
-                logger.info("Bot authenticated: @%s (%s)", username, first_name)
-                async with async_session_factory() as s:
-                    async with s.begin():
-                        if username:
-                            await set_kv(s, "TG_BOT_USERNAME", username)
-                        code = await get_kv(s, "TG_MOD_CODE", "")
-                        if not code:
-                            code = str(random.randint(100000, 999999))
-                            await set_kv(s, "TG_MOD_CODE", code)
-                        logger.info("Telegram moderator code: /mod %s", code)
+        me_res = await send_tg_api("getMe", {}, bot_token=token)
+        if isinstance(me_res, dict) and me_res.get("ok"):
+            me_data = me_res.get("result") or {}
+            username = me_data.get("username", "")
+            first_name = me_data.get("first_name", "")
+            logger.info("Bot authenticated: @%s (%s)", username, first_name)
+            async with async_session_factory() as s:
+                async with s.begin():
+                    if username:
+                        await set_kv(s, "TG_BOT_USERNAME", username)
+                    code = await get_kv(s, "TG_MOD_CODE", "")
+                    if not code:
+                        code = str(random.randint(100000, 999999))
+                        await set_kv(s, "TG_MOD_CODE", code)
+                    logger.info("Telegram moderator code: /mod %s", code)
 
-            # Set commands (matching aitu-gaming-hub single-entry command menu)
-            await client.post(
-                f"https://api.telegram.org/bot{token}/setMyCommands",
-                json={
-                    "commands": [
-                        {"command": "start", "description": "🏠 Главное меню Sunday Open Hub"},
-                    ]
+        # Set commands (matching aitu-gaming-hub single-entry command menu)
+        await send_tg_api(
+            "setMyCommands",
+            {
+                "commands": [
+                    {"command": "start", "description": "🏠 Главное меню Sunday Open Hub"},
+                ]
+            },
+            bot_token=token,
+        )
+
+        # Set chat menu button if webapp url configured
+        if settings.TG_WEBAPP_URL:
+            await send_tg_api(
+                "setChatMenuButton",
+                {
+                    "menu_button": {
+                        "type": "web_app",
+                        "text": "🌐 Hub",
+                        "web_app": {"url": settings.TG_WEBAPP_URL},
+                    }
                 },
+                bot_token=token,
             )
-
-            # Set chat menu button if webapp url configured
-            if settings.TG_WEBAPP_URL:
-                await client.post(
-                    f"https://api.telegram.org/bot{token}/setChatMenuButton",
-                    json={
-                        "menu_button": {
-                            "type": "web_app",
-                            "text": "🌐 Hub",
-                            "web_app": {"url": settings.TG_WEBAPP_URL},
-                        }
-                    },
-                )
     except Exception as exc:
         logger.warning("Bot profile initialization warning: %s", exc)
 
