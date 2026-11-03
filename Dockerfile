@@ -20,6 +20,11 @@ COPY alembic.ini .
 COPY alembic/ ./alembic/
 COPY backend/ ./backend/
 COPY main.py .
+COPY index.html .
+COPY workspace-sync*.js ./
+COPY preview-offline*.js ./
+COPY offline-sw.js ./
+COPY app/ ./app/
 
 EXPOSE 8832
 

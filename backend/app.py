@@ -1,9 +1,10 @@
 from contextlib import asynccontextmanager
 import json
+from pathlib import Path
 from typing import Any, AsyncGenerator
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, RedirectResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -23,6 +24,7 @@ from backend.moderation import (
     get_kv,
     notify_moderators_on_propose,
     render_admin_html,
+    render_admin_login_html,
     review_proposal,
     send_email_async,
     verify_admin_token,
@@ -65,7 +67,15 @@ def json_response(payload: dict[str, Any]) -> Response:
 
 
 @app.get("/")
-async def do_get(session: AsyncSession = Depends(get_session)) -> Response:
+async def do_get(
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    accept = request.headers.get("accept", "")
+    if "text/html" in accept and not accept.startswith("*/*"):
+        idx_path = Path("index.html")
+        if idx_path.is_file():
+            return FileResponse("index.html", media_type="text/html")
     protocol = settings.protocol_version
     try:
         payload = await read_all_data(session)
@@ -154,39 +164,50 @@ async def qr_code_image(
     return Response(content=png_bytes, media_type="image/png")
 
 
-def _resolve_admin_email(request: Request, token: str | None = None) -> str:
+def _resolve_admin_email(request: Request, token: str | None = None) -> str | None:
     candidate = (
         token
         or request.query_params.get("token")
         or request.cookies.get("sunday_admin_token")
         or request.headers.get("X-Admin-Token")
     )
-    email = verify_admin_token(candidate)
-    if not email:
-        raise HTTPException(
-            status_code=403,
-            detail="Only a configured moderator with a verified Google account can review changes",
-        )
-    return email
+    return verify_admin_token(candidate)
 
 
 @app.post("/admin/login")
-async def admin_login(email: str = Form(...)) -> dict[str, Any]:
+async def admin_login(request: Request, email: str = Form(...)) -> Response:
     try:
         clean = verify_moderator_email(email)
     except PermissionError as exc:
+        if "text/html" in (request.headers.get("accept") or ""):
+            return HTMLResponse(
+                content=render_admin_login_html(error=str(exc)), status_code=403
+            )
         raise HTTPException(status_code=403, detail=str(exc)) from exc
 
     token = create_admin_token(clean)
-    base = (settings.PUBLIC_BASE_URL or "http://localhost:8000").rstrip("/")
-    magic_link = f"{base}/admin?token={token}"
+    base = (settings.PUBLIC_BASE_URL or "http://localhost:8832").rstrip("/")
+    magic_link = f"/admin?token={token}"
     if settings.SMTP_HOST:
-        await send_email_async(
-            clean,
-            "Sunday Open: вход в панель модератора",
-            f"Ссылка для входа в очередь одобрения:\n{magic_link}",
+        try:
+            await send_email_async(
+                clean,
+                "Sunday Open: вход в панель модератора",
+                f"Ссылка для входа в очередь одобрения:\n{base}{magic_link}",
+            )
+        except Exception:
+            pass
+
+    if "application/json" in (request.headers.get("accept") or ""):
+        return json_response(
+            {"ok": True, "email": clean, "magic_link": f"{base}{magic_link}"}
         )
-    return {"ok": True, "email": clean, "magic_link": magic_link}
+
+    resp = RedirectResponse(url=magic_link, status_code=303)
+    resp.set_cookie(
+        "sunday_admin_token", token, httponly=True, samesite="lax", max_age=86400
+    )
+    return resp
 
 
 @app.get("/admin")
@@ -195,6 +216,16 @@ async def admin_queue(
     session: AsyncSession = Depends(get_session),
 ) -> Response:
     email = _resolve_admin_email(request)
+    if not email:
+        if "text/html" in (request.headers.get("accept") or ""):
+            return HTMLResponse(
+                content=render_admin_login_html(), status_code=403
+            )
+        raise HTTPException(
+            status_code=403,
+            detail="Only a configured moderator with a verified Google account can review changes",
+        )
+
     token = (
         request.query_params.get("token")
         or request.cookies.get("sunday_admin_token")
@@ -244,6 +275,11 @@ async def admin_review_action(
     session: AsyncSession = Depends(get_session),
 ) -> Response:
     email = _resolve_admin_email(request, token=token)
+    if not email:
+        raise HTTPException(
+            status_code=403,
+            detail="Only a configured moderator with a verified Google account can review changes",
+        )
     approve = action == "approve"
     try:
         async with session.begin():
@@ -271,3 +307,37 @@ async def admin_review_action(
 
     active_token = token or create_admin_token(email)
     return RedirectResponse(url=f"/admin?token={active_token}", status_code=303)
+
+
+@app.get("/workspace")
+async def workspace_page() -> Response:
+    idx_path = Path("index.html")
+    if idx_path.is_file():
+        return FileResponse(idx_path, media_type="text/html")
+    return HTMLResponse("<h1>Workspace index.html not found</h1>", status_code=404)
+
+
+@app.get("/app")
+@app.get("/app/")
+async def mini_app_page() -> Response:
+    idx_path = Path("app/index.html")
+    if idx_path.is_file():
+        return FileResponse(idx_path, media_type="text/html")
+    return HTMLResponse("<h1>Mini App index.html not found</h1>", status_code=404)
+
+
+@app.get("/{static_file:path}")
+async def serve_static_root(static_file: str) -> Response:
+    p = Path(static_file)
+    if p.is_file() and p.suffix in (
+        ".js",
+        ".css",
+        ".html",
+        ".png",
+        ".svg",
+        ".json",
+        ".woff2",
+        ".ico",
+    ):
+        return FileResponse(p)
+    raise HTTPException(status_code=404, detail="Not found")

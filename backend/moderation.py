@@ -620,6 +620,50 @@ def compute_proposal_diff(proposal: Proposal) -> list[dict[str, str]]:
     return diffs
 
 
+def render_admin_login_html(error: str | None = None) -> str:
+    err_html = (
+        f"<div style='color:#b91c1c;background:#fef2f2;border:1px solid #fecaca;padding:12px;border-radius:8px;margin-bottom:16px;font-size:14px;'>"
+        f"{html.escape(error)}</div>"
+        if error
+        else ""
+    )
+    return (
+        "<!DOCTYPE html><html lang='ru'><head><meta charset='utf-8'/>"
+        "<title>Sunday Open · Вход для модераторов</title>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'/>"
+        "<style>"
+        "body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f3f4f6; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 16px; }"
+        ".card { background: #ffffff; padding: 32px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1), 0 2px 4px -2px rgba(0,0,0,0.1); width: 100%; max-width: 420px; box-sizing: border-box; }"
+        "h1 { margin: 0 0 8px 0; font-size: 20px; color: #1e293b; font-weight: 700; }"
+        "p { margin: 0 0 20px 0; color: #64748b; font-size: 14px; line-height: 1.5; }"
+        "label { display: block; margin-bottom: 6px; font-size: 13px; font-weight: 600; color: #374151; }"
+        "input[type=email] { width: 100%; padding: 10px 12px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 14px; box-sizing: border-box; outline: none; transition: border-color 0.2s; }"
+        "input[type=email]:focus { border-color: #2563eb; }"
+        "button { width: 100%; margin-top: 16px; background: #2563eb; color: #ffffff; border: 0; padding: 11px; border-radius: 6px; font-size: 15px; font-weight: 600; cursor: pointer; transition: background 0.2s; }"
+        "button:hover { background: #1d4ed8; }"
+        ".links { margin-top: 24px; padding-top: 16px; border-top: 1px solid #e5e7eb; display: flex; justify-content: space-between; font-size: 13px; }"
+        ".links a { color: #2563eb; text-decoration: none; }"
+        ".links a:hover { text-decoration: underline; }"
+        "</style></head>"
+        "<body>"
+        "<div class='card'>"
+        "<h1>Sunday Open</h1>"
+        "<p>Вход в панель модератора для рассмотрения правок и предложений.</p>"
+        f"{err_html}"
+        "<form method='post' action='/admin/login'>"
+        "<label for='email'>Email модератора</label>"
+        "<input id='email' type='email' name='email' placeholder='moderator@example.com' required autofocus/>"
+        "<button type='submit'>Войти в панель</button>"
+        "</form>"
+        "<div class='links'>"
+        "<a href='/workspace'>📋 Workspace</a>"
+        "<a href='/app'>📱 Портал</a>"
+        "<a href='/docs'>📖 API Docs</a>"
+        "</div>"
+        "</div></body></html>"
+    )
+
+
 def render_admin_html(email: str, proposals: list[Proposal], token: str) -> str:
     rows_html: list[str] = []
     for p in proposals:
