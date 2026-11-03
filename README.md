@@ -110,3 +110,52 @@ node --test tests/sync.test.cjs tests/apps-script.test.cjs tests/offline-shell.t
 ```
 
 Проверяются настоящий клиент и `apps-script.gs` с имитацией сервисов Google Sheets, включая миграцию, конфликты, потерю ответа, повторную отправку, прерывание записи после журнала, несколько вкладок и восстановление черновиков. Эти проверки не заменяют проверку прав доступа и задержек настоящего развёртывания.
+
+## Python Backend Service (FastAPI + PostgreSQL 16 + Redis)
+
+Серверная часть перенесена с монолита Google Apps Script (`Code.gs`) на Python-сервис (FastAPI, SQLAlchemy 2, Alembic, PostgreSQL 16, Redis, Aiogram 3.x, APScheduler, `segno`) с сохранением 100% побайтовой совместимости HTTP-контракта (`GET /`, `POST /`, `Content-Type: text/plain`).
+
+### 1. Запуск через Docker Compose
+
+```sh
+cp .env.example .env
+# Заполните TG_BOT_TOKEN, TG_WEBAPP_URL, PUBLIC_BASE_URL, OPENROUTER_KEY и SMTP_* в .env
+docker compose up -d --build
+```
+
+Контейнер `app` автоматически применяет миграции (`alembic upgrade head`) перед стартом `uvicorn main:app`.
+
+### 2. Локальный запуск и миграции БД
+
+```sh
+python -m alembic upgrade head
+uvicorn main:app --host 0.0.0.0 --port 8000
+```
+
+### 3. Импорт данных из выгрузки Google Таблицы
+
+Скрипт импорта переносит листы `Data`, `SundayHistory`, `SundayProposals`, `SundayNotifications`, `SundayBotUsers`, `SundayAuthors`, `SundayContacts`, `SundayRSVP` и свойства скрипта из JSON-файла или директории CSV-файлов, проверяя SHA-256 хеши и восстанавливая проекцию `records` из журнала `SundayHistory`:
+
+```sh
+python -m backend.import_sheets --input /path/to/sheet_dump.json
+```
+
+### 4. Регистрация Telegram-бота (`setup-bot`)
+
+Команда создаёт секреты `TG_SECRET` и `TG_MOD_CODE` в таблице `kv`, вызывает `getMe`, `setWebhook` (с заголовком `secret_token`), `setMyCommands` и `setChatMenuButton`, и выводит команду `/mod <TG_MOD_CODE>`:
+
+```sh
+python -m backend.cli setup-bot
+```
+
+### 5. Резервное копирование PostgreSQL
+
+```sh
+pg_dump -Fc "$DATABASE_URL" > sunday_open_$(date +%F).dump
+```
+
+### 6. Автоматические контрактные и интеграционные тесты (Python)
+
+```sh
+pytest -v
+```

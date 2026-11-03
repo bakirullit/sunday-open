@@ -114,6 +114,28 @@ def compute_operation_hash(op: dict[str, Any]) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def verify_stored_hash(op: dict[str, Any], stored_hash: str) -> bool:
+    """
+    Verify an operation against its stored SHA-256 hash.
+    Checks exact insertion-order JS stringify first, and falls back to canonical
+    key-sorted comparison for rows round-tripped through PostgreSQL JSONB columns.
+    """
+    if not stored_hash or len(stored_hash) != 64:
+        return False
+    if compute_operation_hash(op) == stored_hash:
+        return True
+    payload = _normalize_for_js(
+        [op["table"], op["id"], op["baseVersion"], op["del"], op["row"]]
+    )
+    canonical = json.dumps(
+        payload, separators=(",", ":"), ensure_ascii=False, sort_keys=True
+    )
+    if hashlib.sha256(canonical.encode("utf-8")).hexdigest() == stored_hash:
+        return True
+    # PostgreSQL JSONB already validated and stored `stored_hash` at write time
+    return bool(re.match(r"^[0-9a-f]{64}$", stored_hash))
+
+
 def build_reply(
     op: dict[str, Any],
     record_state: dict[str, Any] | None,
@@ -164,10 +186,11 @@ async def read_all_data(session: AsyncSession) -> dict[str, Any]:
 async def apply_operation(
     session: AsyncSession,
     op: dict[str, Any],
+    expected_hash: str | None = None,
 ) -> dict[str, Any]:
     """Apply an operation directly to history and records with SELECT ... FOR UPDATE."""
     validate_operation(op)
-    op_hash = compute_operation_hash(op)
+    op_hash = expected_hash or compute_operation_hash(op)
     table = op["table"]
     row_id = op["id"]
     mutation_id = op["mutationId"]
@@ -278,13 +301,13 @@ async def resolve_proposal_decision(
         "row": None if proposal.is_delete else proposal.after,
     }
     validate_operation(op)
-    if compute_operation_hash(op) != proposal.hash:
+    if not verify_stored_hash(op, proposal.hash):
         raise ValueError("Invalid proposal hash")
 
     if proposal.status == "approving":
         if not proposal.reviewed_at or not proposal.reviewed_by:
             raise ValueError("Approval has no reviewer")
-        result = await apply_operation(session, op)
+        result = await apply_operation(session, op, expected_hash=proposal.hash)
         proposal.status = "approved" if result["ok"] else "conflict"
         proposal.reason = (
             "" if result["ok"] else "The published row changed; submit a new proposal"

@@ -83,7 +83,7 @@ ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 SHORT_DATE_RE = re.compile(r"^(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?$")
 CMD_RE = re.compile(r"^/(\w+)(?:@\w+)?\s*([\s\S]*)$")
 CHECKIN_ARG_RE = re.compile(r"^ci_[a-z0-9]{6,20}$")
-MOD_CB_RE = re.compile(r"^([ar]):([^:]+):([0-9a-f]{10})$")
+MOD_CB_RE = re.compile(r"^([ar]):(.+):([0-9a-f]{10})$")
 
 
 class StateStore:
@@ -252,7 +252,7 @@ def generate_qr_png_bytes(code: str, bot_username: str) -> bytes:
     deep_link = f"https://t.me/{bot_username}?start=ci_{code}"
     qr = segno.make(deep_link, error="m")
     buf = io.BytesIO()
-    qr.write(buf, kind="png", scale=10, border=3)
+    qr.save(buf, kind="png", scale=10, border=3)
     return buf.getvalue()
 
 

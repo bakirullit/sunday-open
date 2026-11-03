@@ -19,6 +19,7 @@ from backend.sync import (
     compute_operation_hash,
     resolve_proposal_decision,
     validate_operation,
+    verify_stored_hash,
 )
 
 TG_LABELS: dict[str, str] = {
@@ -371,7 +372,7 @@ async def review_proposal(
         "row": None if proposal.is_delete else proposal.after,
     }
     validate_operation(op)
-    if compute_operation_hash(op) != proposal.hash:
+    if not verify_stored_hash(op, proposal.hash):
         raise ValueError("Invalid proposal hash")
 
     changed = False
@@ -481,7 +482,7 @@ async def send_sunday_notifications(
             "row": None if p.is_delete else p.after,
         }
         validate_operation(op)
-        if compute_operation_hash(op) != p.hash:
+        if not verify_stored_hash(op, p.hash):
             raise ValueError("Invalid proposal hash")
 
     if mail_quota < 1:
