@@ -21,10 +21,10 @@ COPY alembic/ ./alembic/
 COPY backend/ ./backend/
 COPY main.py .
 
-EXPOSE 8000
+EXPOSE 8832
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -f http://localhost:8000/ || exit 1
+    CMD curl -f http://localhost:8832/ || exit 1
 
 CMD ["sh", "-c", "alembic upgrade head && python main.py"]
 

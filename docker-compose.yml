@@ -13,7 +13,7 @@ services:
     volumes:
       - sunday_postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-sunday_open}"]
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-sunday_open}" ]
       interval: 3s
       timeout: 3s
       retries: 5
@@ -27,7 +27,7 @@ services:
     volumes:
       - sunday_redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: [ "CMD", "redis-cli", "ping" ]
       interval: 3s
       timeout: 3s
       retries: 5
@@ -50,9 +50,9 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - TZ=${TZ:-Asia/Almaty}
       - HOST=0.0.0.0
-      - PORT=8000
+      - PORT=8832
     ports:
-      - "8000:8000"
+      - "8832:8832"
 
 volumes:
   sunday_postgres_data:
