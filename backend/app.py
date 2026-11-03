@@ -24,7 +24,7 @@ from backend.bot import (
     verify_init_data,
 )
 from backend.config import settings
-from backend.database import get_session
+from backend.database import async_session_factory, get_session
 from backend.models import Proposal
 from backend.moderation import (
     compute_proposal_diff,
@@ -39,11 +39,19 @@ from backend.moderation import (
     verify_moderator_email,
 )
 from backend.scheduler import create_scheduler
+from backend.seed import ensure_seed_data
 from backend.sync import apply_operation, propose_operation, read_all_data
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
+    try:
+        async with async_session_factory() as session:
+            async with session.begin():
+                await ensure_seed_data(session)
+    except Exception as exc:
+        logger.warning("Startup seed check skipped: %s", exc)
+
     scheduler = create_scheduler()
     scheduler.start()
     polling_task = None
@@ -103,7 +111,20 @@ async def do_get(
         return json_response({"protocol": protocol, "ok": False, "error": str(exc)})
 
 
+@app.get("/api")
+async def do_get_api(
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    protocol = settings.protocol_version
+    try:
+        payload = await read_all_data(session)
+        return json_response(payload)
+    except Exception as exc:
+        return json_response({"protocol": protocol, "ok": False, "error": str(exc)})
+
+
 @app.post("/")
+@app.post("/api")
 async def do_post(
     request: Request,
     session: AsyncSession = Depends(get_session),

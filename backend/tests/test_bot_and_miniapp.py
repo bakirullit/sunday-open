@@ -827,3 +827,51 @@ async def test_anchor_wizard_onboarding_and_5w1h_single_message(
         # Still only 1 sendMessage call in the entire session!
         assert len(sends) == 1
 
+        # 9. Test seed data + GET /api + in-bot Workspace & RSVP flows
+        from backend.seed import ensure_seed_data
+
+        async with session_maker() as s:
+            async with s.begin():
+                seeded = await ensure_seed_data(s)
+                assert seeded == 126
+
+        api_res = await client.get("/api", headers={"Accept": "text/html"})
+        assert api_res.status_code == 200
+        api_json = api_res.json()
+        assert len(api_json["data"]["portal"]["rows"]) >= 15
+        assert len(api_json["data"]["sundays"]["rows"]) == 4
+
+        # Navigate to Workspace screen ('nav:open:workspace') and switch tab ('ws:tab:steps')
+        await client.post(
+            "/api?tg=wh_sec_anchor",
+            content=json.dumps(
+                {
+                    "update_id": 7008,
+                    "callback_query": {
+                        "id": "cb-5",
+                        "from": user,
+                        "message": {"message_id": 888, "chat": {"id": 7007, "type": "private"}},
+                        "data": "nav:open:workspace",
+                    },
+                }
+            ),
+        )
+        assert "План 4 воскресений" in edits[-1]["text"]
+
+        await client.post(
+            "/api?tg=wh_sec_anchor",
+            content=json.dumps(
+                {
+                    "update_id": 7009,
+                    "callback_query": {
+                        "id": "cb-6",
+                        "from": user,
+                        "message": {"message_id": 888, "chat": {"id": 7007, "type": "private"}},
+                        "data": "ws:tab:steps",
+                    },
+                }
+            ),
+        )
+        assert "Первые шаги" in edits[-1]["text"]
+
+

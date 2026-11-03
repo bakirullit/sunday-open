@@ -1,8 +1,8 @@
 // Only the test site's static shell is cached. API requests always use the network.
 const PREFIX = 'sunday-open-shell:' + self.registration.scope + ':';
-const CACHE = PREFIX + '014d07a7ffa74c45';
+const CACHE = PREFIX + '61675ad8fafe4ad3';
 const HOME = new URL('index.html', self.registration.scope).href;
-const FILES = ['index.html', 'workspace-sync.014d07a7ffa74c45.js', 'preview-offline.014d07a7ffa74c45.js']
+const FILES = ['index.html', 'workspace-sync.61675ad8fafe4ad3.js', 'preview-offline.61675ad8fafe4ad3.js']
   .map(file => new URL(file, self.registration.scope).href);
 
 self.addEventListener('install', event => {
@@ -10,7 +10,7 @@ self.addEventListener('install', event => {
     const cache = await caches.open(CACHE);
     await cache.addAll(FILES.map(url => new Request(url, {cache: 'reload'})));
     const html = await (await cache.match(HOME)).text();
-    if (!html.includes('workspace-sync.014d07a7ffa74c45.js')) {
+    if (!html.includes('workspace-sync.61675ad8fafe4ad3.js')) {
       await caches.delete(CACHE);
       throw new Error('Test deployment is not ready yet');
     }

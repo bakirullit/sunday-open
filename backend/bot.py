@@ -29,6 +29,7 @@ from backend.models import (
 )
 from backend.moderation import (
     TG_LABELS,
+    _get_shared_tg_client,
     get_kv,
     get_tg_moderators,
     is_tg_moderator,
@@ -282,11 +283,8 @@ async def send_tg_qr_photo(
     }
     files = {"photo": (f"qr_{code}.png", png_bytes, "image/png")}
     try:
-        if http_client is not None:
-            resp = await http_client.post(url, data=data, files=files, timeout=15.0)
-        else:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.post(url, data=data, files=files)
+        client = http_client or _get_shared_tg_client()
+        resp = await client.post(url, data=data, files=files, timeout=15.0)
         return resp.json()
     except Exception:
         return None
@@ -311,11 +309,8 @@ async def send_tg_csv_document(
     }
     files = {"document": (filename, csv_text.encode("utf-8"), "text/csv")}
     try:
-        if http_client is not None:
-            resp = await http_client.post(url, data=data, files=files, timeout=15.0)
-        else:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.post(url, data=data, files=files)
+        client = http_client or _get_shared_tg_client()
+        resp = await client.post(url, data=data, files=files, timeout=15.0)
         return resp.json()
     except Exception:
         return None
@@ -2084,6 +2079,122 @@ async def handle_tg_callback(
             "🔔 Напоминания включены" if next_rem else "🔕 Напоминания выключены"
         )
 
+    # 4b. Workspace sub-tab switch (ws:tab:<tab>)
+    if data.startswith("ws:tab:"):
+        from backend.anchor_ui import create_default_navigator
+
+        tab_name = data[len("ws:tab:") :]
+        nav = create_default_navigator(state_store=state_store)
+        await nav.navigate(
+            session=session,
+            user_id=uid,
+            chat_id=chat_id,
+            screen_id="workspace",
+            payload={"tab": tab_name},
+            push_to_history=False,
+            anchor_message_id=message_id,
+            send_msg_fn=sender,
+            send_api_fn=api_caller,
+        )
+        return await answer()
+
+    # 4c. In-Bot Event RSVP & QR Ticket actions (rsvp:go:<card_id>, rsvp:cancel:<card_id>, rsvp:qr:<card_id>)
+    if data.startswith("rsvp:"):
+        from backend.anchor_ui import create_default_navigator
+
+        parts = data.split(":", 2)
+        if len(parts) == 3:
+            action_type, card_prefix = parts[1], parts[2]
+            nav = create_default_navigator(state_store=state_store)
+            portal_rows = await get_portal_rows(session)
+            card = next(
+                (
+                    r
+                    for r in portal_rows
+                    if str(r.get("_id") or "") == card_prefix
+                    or str(r.get("_id") or "").startswith(card_prefix)
+                ),
+                None,
+            )
+            full_card_id = str(card.get("_id") if card else card_prefix)
+
+            if action_type == "qr":
+                rsvp_row = (
+                    await session.execute(
+                        select(Rsvp).where(
+                            Rsvp.event_id == full_card_id,
+                            Rsvp.tg_id == str(uid),
+                            Rsvp.status == "going",
+                        )
+                    )
+                ).scalar_one_or_none()
+                if not rsvp_row:
+                    return await answer("Активный билет не найден", True)
+                bot_username = await get_kv(session, "TG_BOT_USERNAME", "")
+                ev_line = tg_ev_line(rsvp_row.title, rsvp_row.date)
+                caption = (
+                    f"🎟 <b>Ваш билет:</b> {ev_line}\n"
+                    f"Код: <code>{tg_esc(rsvp_row.code)}</code>\n\n"
+                    "Покажите этот QR-код организатору на входе."
+                )
+                await send_tg_qr_photo(chat_id, rsvp_row.code, caption, bot_username)
+                return await answer("📲 QR-билет отправлен в чат")
+
+            if action_type in ("go", "cancel"):
+                if not card:
+                    return await answer("Событие не найдено", True)
+                going_flag = action_type == "go"
+                ev_payload = {
+                    "id": full_card_id,
+                    "title": card.get("title") or "Событие",
+                    "date": str(card.get("date") or ""),
+                    "club": card.get("club") or "",
+                }
+                note = await set_rsvp(
+                    session=session,
+                    user=from_user,
+                    ev=ev_payload,
+                    going=going_flag,
+                    send_msg_fn=sender,
+                )
+                if note.get("error") == "profile":
+                    await nav.navigate(
+                        session=session,
+                        user_id=uid,
+                        chat_id=chat_id,
+                        screen_id="profile",
+                        payload={},
+                        push_to_history=True,
+                        anchor_message_id=message_id,
+                        send_msg_fn=sender,
+                        send_api_fn=api_caller,
+                    )
+                    return await answer(
+                        "⚠️ Сначала заполните профиль: ФИО, телефон, клуб и роль.",
+                        True,
+                    )
+                if note.get("error") == "past":
+                    return await answer("⚠️ Это событие уже прошло.", True)
+                if note.get("error"):
+                    return await answer("Не удалось записаться на это событие.", True)
+
+                await nav.navigate(
+                    session=session,
+                    user_id=uid,
+                    chat_id=chat_id,
+                    screen_id="idea_detail",
+                    payload={"card_id": full_card_id},
+                    push_to_history=False,
+                    anchor_message_id=message_id,
+                    send_msg_fn=sender,
+                    send_api_fn=api_caller,
+                )
+                return await answer(
+                    "✅ Вы записаны! QR-билет отправлен в чат"
+                    if going_flag
+                    else "Запись отменена"
+                )
+
     # 5. Legacy role selection in /register (g:0, g:1, g:2)
     if re.match(r"^g:\d$", data):
         role_idx = int(data[2:])
@@ -2246,6 +2357,32 @@ async def handle_tg_callback(
     suffix_actor = (
         f" · {tg_name(from_user)}" if result["changed"] else " · рассмотрено раньше"
     )
+
+    from backend.anchor_ui import create_default_navigator
+
+    nav = create_default_navigator(state_store=state_store)
+    anchor_id = await nav.get_anchor_id(uid, session=session)
+    top = await nav.stack.peek(uid, session=session)
+    if (
+        anchor_id is not None
+        and message_id is not None
+        and int(anchor_id) == int(message_id)
+        and top
+        and top.get("screen_id") == "moderation"
+    ):
+        await nav.navigate(
+            session=session,
+            user_id=uid,
+            chat_id=chat_id,
+            screen_id="moderation",
+            payload={},
+            push_to_history=False,
+            anchor_message_id=message_id,
+            send_msg_fn=sender,
+            send_api_fn=api_caller,
+        )
+        return await answer(label)
+
     await close_msg(f"{label}{suffix_actor}")
     return await answer(label)
 

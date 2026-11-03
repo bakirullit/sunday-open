@@ -25,9 +25,10 @@ from backend.bot import (
     get_portal_rows,
     tg_days_from_today,
 )
-from backend.models import BotUser, Contact, Proposal
+from backend.models import BotUser, Contact, Proposal, Record, Rsvp
 from backend.moderation import (
     TG_LABELS,
+    compute_proposal_diff,
     get_kv,
     is_tg_moderator,
     send_tg_api,
@@ -36,6 +37,7 @@ from backend.moderation import (
     tg_cut,
     tg_date_fmt,
     tg_esc,
+    tg_table_label,
     tg_webapp_button,
     tg_webapp_kb,
 )
@@ -506,6 +508,7 @@ def get_club_info_screen() -> Screen:
         [{"text": "📝 Пройти регистрацию", "callback_data": "auth:start_reg"}],
         [{"text": "💡 Банк идей", "callback_data": "nav:open:ideas"}],
         [{"text": "📅 Календарь событий", "callback_data": "nav:open:calendar"}],
+        [{"text": "📊 Штаб · План 4 воскресений", "callback_data": "nav:open:workspace"}],
     ]
     webapp_btn = tg_webapp_button("🌐 Открыть Hub (Web App)")
     if webapp_btn:
@@ -546,8 +549,14 @@ def get_authorized_menu_screen(
     rem_status = "🔔 Напоминания: Вкл" if reminders_on else "🔕 Напоминания: Выкл"
     rows: list[list[dict[str, Any]]] = [
         [{"text": "💡 Подать идею (Anchor Wizard)", "callback_data": "wiz:new_idea"}],
-        [{"text": "📚 Банк идей", "callback_data": "nav:open:ideas"}],
-        [{"text": "📅 Календарь событий", "callback_data": "nav:open:calendar"}],
+        [
+            {"text": "📚 Банк идей", "callback_data": "nav:open:ideas"},
+            {"text": "📅 Календарь", "callback_data": "nav:open:calendar"},
+        ],
+        [
+            {"text": "🎟 Мои билеты (QR)", "callback_data": "nav:open:my_tickets"},
+            {"text": "📊 План штаба", "callback_data": "nav:open:workspace"},
+        ],
     ]
 
     if role == "Организатор" or is_mod:
@@ -556,8 +565,10 @@ def get_authorized_menu_screen(
     if is_mod:
         rows.append([{"text": "🛡 Очередь модерации", "callback_data": "nav:open:moderation"}])
 
-    rows.append([{"text": "👤 Мой профиль", "callback_data": "nav:open:profile"}])
-    rows.append([{"text": rem_status, "callback_data": "act:toggle_remind"}])
+    rows.append([
+        {"text": "👤 Мой профиль", "callback_data": "nav:open:profile"},
+        {"text": rem_status, "callback_data": "act:toggle_remind"},
+    ])
 
     webapp_btn = tg_webapp_button("🌐 Открыть Sunday Open Web Hub")
     if webapp_btn:
@@ -950,7 +961,7 @@ async def render_ideas_stage_screen(
 
 async def render_idea_detail_screen(
     session: AsyncSession,
-    _user_id: int | str,
+    user_id: int | str,
     _chat_id: int | str,
     payload: dict[str, Any],
 ) -> Screen:
@@ -971,7 +982,8 @@ async def render_idea_detail_screen(
             reply_markup={"inline_keyboard": []},
             title="Карточка",
         )
-    title = card.get("title") or card_id
+    full_card_id = str(card.get("_id") or card_id)
+    title = card.get("title") or full_card_id
     lines = [
         f"<b>{tg_esc(title)}</b>",
         f"Этап: <b>{tg_esc(card.get('stage') or 'Идея')}</b>",
@@ -984,8 +996,34 @@ async def render_idea_detail_screen(
         label = TG_LABELS.get(field_key, field_key)
         lines.append(f"<b>{tg_esc(label)}:</b> {tg_esc(disp)}")
 
+    # Check RSVP status and participant count in PostgreSQL
+    rsvps_res = await session.execute(
+        select(Rsvp).where(Rsvp.event_id == full_card_id, Rsvp.status == "going")
+    )
+    going_rsvps = list(rsvps_res.scalars().all())
+    user_rsvp = next((r for r in going_rsvps if str(r.tg_id) == str(user_id)), None)
+
     kb_rows: list[list[dict[str, Any]]] = []
-    btn = tg_webapp_button("Открыть карточку", f"sel={quote(str(card.get('_id') or card_id))}")
+    if card.get("date") and card.get("stage") not in ("Отклонена", "Закрыт"):
+        lines.append("")
+        lines.append(f"👥 <b>Записались:</b> {len(going_rsvps)} чел.")
+        if user_rsvp:
+            checked_str = " (отмечен на входе ✅)" if user_rsvp.checked_in_at else ""
+            lines.append(
+                f"🎟 <b>Ваш статус:</b> Вы записаны · билет <code>{tg_esc(user_rsvp.code)}</code>{checked_str}"
+            )
+            kb_rows.append([
+                {"text": "📲 Прислать QR-билет в чат", "callback_data": f"rsvp:qr:{full_card_id[:48]}"}
+            ])
+            kb_rows.append([
+                {"text": "❌ Отменить запись", "callback_data": f"rsvp:cancel:{full_card_id[:48]}"}
+            ])
+        else:
+            kb_rows.append([
+                {"text": "🎟 Записаться на событие (RSVP)", "callback_data": f"rsvp:go:{full_card_id[:48]}"}
+            ])
+
+    btn = tg_webapp_button("Открыть карточку", f"sel={quote(full_card_id)}")
     if btn:
         kb_rows.append([btn])
     return Screen(
@@ -1131,6 +1169,133 @@ async def render_list_screen(
     )
 
 
+async def render_my_tickets_screen(
+    session: AsyncSession,
+    user_id: int | str,
+    _chat_id: int | str,
+    _payload: dict[str, Any],
+) -> Screen:
+    rsvps_res = await session.execute(
+        select(Rsvp)
+        .where(Rsvp.tg_id == str(user_id), Rsvp.status == "going")
+        .order_by(Rsvp.date.asc())
+    )
+    mine = list(rsvps_res.scalars().all())
+    if not mine:
+        text = (
+            "🎟 <b>Мои билеты (QR)</b>\n\n"
+            "У вас пока нет активных записей на события.\n"
+            "Откройте <b>«📅 Календарь событий»</b> или <b>«📚 Банк идей»</b>, "
+            "выберите мероприятие и нажмите <b>«🎟 Записаться на событие (RSVP)»</b>."
+        )
+        kb_rows = [
+            [{"text": "📅 Открыть календарь событий", "callback_data": "nav:open:calendar"}],
+            [{"text": "📚 Открыть банк идей", "callback_data": "nav:open:ideas"}],
+        ]
+        return Screen(
+            text=text,
+            reply_markup={"inline_keyboard": kb_rows},
+            title="🎟 Мои билеты",
+        )
+
+    lines = [f"🎟 <b>Мои билеты (QR)</b> · активных: {len(mine)}", ""]
+    kb_rows = []
+    for r in mine[:10]:
+        d_fmt = tg_date_fmt(r.date)[:5] if r.date else ""
+        chk = " · ✅ отмечен на входе" if r.checked_in_at else ""
+        lines.append(
+            f"• <b>{tg_esc(r.title)}</b> ({d_fmt}) — код <code>{tg_esc(r.code)}</code>{chk}"
+        )
+        kb_rows.append([
+            {"text": f"📲 QR · {tg_cut(r.title, 20)}", "callback_data": f"rsvp:qr:{r.event_id[:48]}"},
+            {"text": "📄 Карточка", "callback_data": f"nav:card:{r.event_id[:48]}"},
+        ])
+
+    return Screen(
+        text="\n".join(lines),
+        reply_markup={"inline_keyboard": kb_rows},
+        title="🎟 Мои билеты",
+    )
+
+
+async def render_workspace_screen(
+    session: AsyncSession,
+    _user_id: int | str,
+    _chat_id: int | str,
+    payload: dict[str, Any],
+) -> Screen:
+    tab = str(payload.get("tab") or "sundays")
+    res = await session.execute(
+        select(Record).where(Record.tbl == tab, Record.deleted.is_(False))
+    )
+    recs = [r.row for r in res.scalars().all() if r.row]
+    recs.sort(key=lambda x: int(x.get("_o") or 0))
+
+    lines: list[str] = []
+    if tab == "sundays":
+        lines.append("📊 <b>Штаб Sunday Open · План 4 воскресений</b>\n")
+        for r in recs:
+            num = r.get("num") or ""
+            date_s = r.get("date") or ""
+            theme = r.get("theme") or ""
+            mission = r.get("mission") or ""
+            target = r.get("target") or ""
+            evs = r.get("events") or []
+            lines.append(f"🗓 <b>{tg_esc(num)} ({tg_esc(date_s)}) — {tg_esc(theme)}</b>")
+            if mission:
+                lines.append(f"<i>{tg_esc(mission)}</i>")
+            for ev in evs:
+                if isinstance(ev, dict):
+                    lines.append(
+                        f"  • <b>{tg_esc(ev.get('name'))}</b> — {tg_esc(ev.get('sub'))} ({tg_esc(ev.get('loc'))})"
+                    )
+            if target:
+                lines.append(f"  🎯 Ориентир: {tg_esc(target)}")
+            lines.append("")
+    elif tab == "steps":
+        lines.append("🚀 <b>Штаб Sunday Open · Первые шаги</b>\n")
+        for r in recs[:12]:
+            st_badge = "✅" if r.get("status") == "Готово" else ("⏳" if r.get("status") == "В работе" else "⬜")
+            lines.append(
+                f"{st_badge} <b>{tg_esc(r.get('step'))}</b> (до {tg_esc(r.get('deadline'))})\n"
+                f"   👤 {tg_esc(r.get('who'))} · {tg_esc(r.get('what'))}"
+            )
+    elif tab == "bookings":
+        lines.append("🏛 <b>Штаб Sunday Open · Брони локаций</b>\n")
+        for r in recs[:15]:
+            lines.append(
+                f"• <b>{tg_esc(r.get('date'))}</b> · {tg_esc(r.get('event'))}\n"
+                f"  📍 {tg_esc(r.get('room'))} ({tg_esc(r.get('time'))}) · {tg_esc(r.get('status'))}"
+            )
+    elif tab == "briefs":
+        lines.append("📋 <b>Штаб Sunday Open · Брифы 5W1H</b>\n")
+        for r in recs[:8]:
+            lines.append(
+                f"• <b>{tg_esc(r.get('name'))}</b> ({tg_esc(r.get('when'))})\n"
+                f"  📍 {tg_esc(r.get('where'))}\n"
+                f"  💡 {tg_cut(r.get('what') or '', 120)}"
+            )
+
+    if not recs:
+        lines.append("Записей в этом разделе пока нет.")
+
+    kb_rows = [
+        [
+            {"text": ("🔘 " if tab == "sundays" else "") + "🗓 4 воскресенья", "callback_data": "ws:tab:sundays"},
+            {"text": ("🔘 " if tab == "steps" else "") + "🚀 Шаги запуска", "callback_data": "ws:tab:steps"},
+        ],
+        [
+            {"text": ("🔘 " if tab == "bookings" else "") + "🏛 Локации", "callback_data": "ws:tab:bookings"},
+            {"text": ("🔘 " if tab == "briefs" else "") + "📋 Брифы 5W1H", "callback_data": "ws:tab:briefs"},
+        ],
+    ]
+    return Screen(
+        text="\n".join(lines).strip(),
+        reply_markup={"inline_keyboard": kb_rows},
+        title="📊 План штаба",
+    )
+
+
 async def render_moderation_screen(
     session: AsyncSession,
     user_id: int | str,
@@ -1147,7 +1312,7 @@ async def render_moderation_screen(
         await session.execute(
             select(Proposal)
             .where(Proposal.status == "pending")
-            .order_by(Proposal.created_at.desc())
+            .order_by(Proposal.created_at.asc())
             .limit(10)
         )
     ).scalars().all()
@@ -1162,13 +1327,27 @@ async def render_moderation_screen(
     lines = [f"<b>🛡 Очередь модерации</b> · {len(proposals)} на рассмотрении:\n"]
     kb_rows: list[list[dict[str, Any]]] = []
     for p in proposals:
-        op = p.payload or {}
-        row = op.get("row") or {}
-        title = row.get("title") or p.ref
-        is_del = bool(op.get("del"))
-        action_kind = "удаление" if is_del else ("новая" if p.op_hash else "правка")
-        lines.append(f"• <b>{tg_esc(title)}</b> ({action_kind})")
-        cb_suffix = f"{p.ref}:{p.op_hash[:10]}"
+        row_obj = p.after if isinstance(p.after, dict) else (p.before if isinstance(p.before, dict) else {})
+        title = (
+            row_obj.get("title")
+            or row_obj.get("name")
+            or row_obj.get("event")
+            or row_obj.get("step")
+            or p.id
+        )
+        action_kind = (
+            "удаление"
+            if p.is_delete
+            else ("новая карточка" if not p.before else "изменение")
+        )
+        tbl_label = tg_table_label(p.tbl)
+        diffs = compute_proposal_diff(p)
+        diff_preview = "; ".join(f"{k}: {tg_cut(v, 40)}" for k, v in list(diffs.items())[:3])
+        lines.append(
+            f"• <b>{tg_esc(title)}</b> ({tg_esc(tbl_label)} · {action_kind})"
+            + (f"\n  <i>{tg_esc(diff_preview)}</i>" if diff_preview else "")
+        )
+        cb_suffix = f"{p.mutation_id}:{p.hash[:10]}"
         kb_rows.append([
             {"text": f"✅ {tg_cut(title, 20)}", "callback_data": f"a:{cb_suffix}"},
             {"text": "❌ Отклонить", "callback_data": f"r:{cb_suffix}"},
@@ -1191,6 +1370,8 @@ def create_default_navigator(
     nav.register_screen("ideas_stage", "📂 Этап", render_ideas_stage_screen)
     nav.register_screen("idea_detail", "📄 Карточка", render_idea_detail_screen)
     nav.register_screen("calendar", "📅 Календарь", render_calendar_screen)
+    nav.register_screen("my_tickets", "🎟 Мои билеты", render_my_tickets_screen)
+    nav.register_screen("workspace", "📊 План штаба", render_workspace_screen)
     nav.register_screen("profile", "👤 Профиль", render_profile_screen)
     nav.register_screen("list", "📋 Списки", render_list_screen)
     nav.register_screen("moderation", "🛡 Модерация", render_moderation_screen)
