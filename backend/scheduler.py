@@ -6,6 +6,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.bot import run_sunday_bot_daily
 from backend.config import settings
 from backend.database import async_session_factory
 from backend.moderation import send_sunday_notifications
@@ -44,6 +45,14 @@ async def run_email_digest_job() -> str:
             )
 
 
+async def run_daily_bot_job() -> str:
+    async with async_session_factory() as session:
+        async with session.begin():
+            return await try_with_db_advisory_lock(
+                session, LOCK_ID_DAILY_JOB, run_sunday_bot_daily
+            )
+
+
 def create_scheduler(
     daily_job_fn: Callable[[], Awaitable[str]] | None = None,
 ) -> AsyncIOScheduler:
@@ -56,13 +65,12 @@ def create_scheduler(
         max_instances=1,
         coalesce=True,
     )
-    if daily_job_fn is not None:
-        scheduler.add_job(
-            daily_job_fn,
-            trigger=CronTrigger(hour=9, minute=0, timezone=settings.TZ),
-            id="sunday_bot_daily",
-            replace_existing=True,
-            max_instances=1,
-            coalesce=True,
-        )
+    scheduler.add_job(
+        daily_job_fn or run_daily_bot_job,
+        trigger=CronTrigger(hour=9, minute=0, timezone=settings.TZ),
+        id="sunday_bot_daily",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
     return scheduler

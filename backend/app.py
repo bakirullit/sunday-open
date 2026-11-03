@@ -1,18 +1,26 @@
+from contextlib import asynccontextmanager
 import json
-from typing import Any
+from typing import Any, AsyncGenerator
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.ai import handle_ai_proxy
+from backend.bot import (
+    generate_qr_png_bytes,
+    handle_mini_app_api,
+    handle_tg_webhook,
+    verify_init_data,
+)
 from backend.config import settings
 from backend.database import get_session
 from backend.models import Proposal
 from backend.moderation import (
     compute_proposal_diff,
     create_admin_token,
+    get_kv,
     notify_moderators_on_propose,
     render_admin_html,
     review_proposal,
@@ -20,9 +28,21 @@ from backend.moderation import (
     verify_admin_token,
     verify_moderator_email,
 )
+from backend.scheduler import create_scheduler
 from backend.sync import apply_operation, propose_operation, read_all_data
 
-app = FastAPI(title="Sunday Open Backend", version="1.0.0")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
+    scheduler = create_scheduler()
+    scheduler.start()
+    try:
+        yield
+    finally:
+        scheduler.shutdown(wait=False)
+
+
+app = FastAPI(title="Sunday Open Backend", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -67,11 +87,41 @@ async def do_post(
     except Exception:
         pre = None
 
-    # OpenRouter AI helper proxy bypasses locking and moderation
+    # 1. Telegram Webhook (?tg=<TG_SECRET>)
+    tg_secret_param = request.query_params.get("tg")
+    if tg_secret_param is not None:
+        header_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+        try:
+            async with session.begin():
+                await handle_tg_webhook(
+                    session=session,
+                    secret_param=tg_secret_param,
+                    header_secret=header_secret,
+                    update=pre,
+                )
+        except Exception:
+            pass
+        return PlainTextResponse(
+            content="ok",
+            status_code=200,
+            headers={"Access-Control-Allow-Origin": "*"},
+        )
+
+    # 2. OpenRouter AI helper proxy bypasses locking and moderation
     if isinstance(pre, dict) and "ai" in pre:
         ai_res = await handle_ai_proxy(pre.get("ai"))
         return json_response(ai_res)
 
+    # 3. Telegram Mini App API (me / reg / rsvp)
+    if isinstance(pre, dict) and any(k in pre for k in ("me", "reg", "rsvp")):
+        try:
+            async with session.begin():
+                mini_res = await handle_mini_app_api(session, pre)
+            return json_response(mini_res)
+        except Exception:
+            return json_response({"ok": False, "error": "busy"})
+
+    # 4. Sync operation (protocol 3 or 4)
     protocol = settings.protocol_version
     if not isinstance(pre, dict) or pre.get("protocol") != protocol:
         return json_response(
@@ -84,6 +134,7 @@ async def do_post(
                 result = await propose_operation(
                     session,
                     pre,
+                    verify_tg_fn=verify_init_data,
                     notify_mods_fn=notify_moderators_on_propose,
                 )
             else:
@@ -91,6 +142,16 @@ async def do_post(
         return json_response(result)
     except Exception as exc:
         return json_response({"protocol": protocol, "ok": False, "error": str(exc)})
+
+
+@app.get("/qr/{code}.png")
+async def qr_code_image(
+    code: str,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    bot_username = await get_kv(session, "TG_BOT_USERNAME", "")
+    png_bytes = generate_qr_png_bytes(code, bot_username)
+    return Response(content=png_bytes, media_type="image/png")
 
 
 def _resolve_admin_email(request: Request, token: str | None = None) -> str:
