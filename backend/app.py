@@ -1,7 +1,15 @@
+import asyncio
 from contextlib import asynccontextmanager
 import json
+import logging
 from pathlib import Path
 from typing import Any, AsyncGenerator
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("sunday_open")
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, RedirectResponse
@@ -38,9 +46,20 @@ from backend.sync import apply_operation, propose_operation, read_all_data
 async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
     scheduler = create_scheduler()
     scheduler.start()
+    polling_task = None
+    if settings.TG_BOT_TOKEN and not settings.TG_BOT_TOKEN.startswith("123456"):
+        from backend.polling import run_bot_polling
+
+        polling_task = asyncio.create_task(run_bot_polling())
     try:
         yield
     finally:
+        if polling_task is not None:
+            polling_task.cancel()
+            try:
+                await polling_task
+            except asyncio.CancelledError:
+                pass
         scheduler.shutdown(wait=False)
 
 
