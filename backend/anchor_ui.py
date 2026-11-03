@@ -1,5 +1,6 @@
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from datetime import date, timedelta
 import json
 import logging
 from typing import Any
@@ -12,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.bot import (
     IDEA_STAGE_ORDER,
+    TG_STEPS,
     StateStore,
     contact_to_profile,
     default_state_store,
@@ -21,6 +23,7 @@ from backend.bot import (
     get_managed_events,
     get_missing_profile_fields,
     get_portal_rows,
+    tg_days_from_today,
 )
 from backend.models import BotUser, Contact, Proposal
 from backend.moderation import (
@@ -32,7 +35,6 @@ from backend.moderation import (
     set_kv,
     tg_cut,
     tg_date_fmt,
-    tg_days_from_today,
     tg_esc,
     tg_webapp_button,
     tg_webapp_kb,
@@ -420,6 +422,414 @@ class AnchorNavigator:
             send_api_fn=send_api_fn,
         )
 
+    async def render_screen(
+        self,
+        session: AsyncSession,
+        user_id: int | str,
+        chat_id: int | str,
+        screen: Screen,
+        anchor_message_id: int | None = None,
+        force_new_message: bool = False,
+        send_msg_fn: Callable[..., Awaitable[Any]] | None = None,
+        send_api_fn: Callable[..., Awaitable[Any]] | None = None,
+    ) -> Screen:
+        """Render a declarative Screen directly into the single persistent anchor message."""
+        if anchor_message_id is not None:
+            await self.set_anchor_id(user_id, anchor_message_id, session=session)
+
+        target_msg_id = (
+            None
+            if force_new_message
+            else (
+                anchor_message_id
+                or await self.get_anchor_id(user_id, session=session)
+            )
+        )
+
+        sender = send_msg_fn or send_tg_message
+        api_caller = send_api_fn or send_tg_api
+
+        if target_msg_id is not None:
+            edit_res = await api_caller(
+                "editMessageText",
+                {
+                    "chat_id": chat_id,
+                    "message_id": target_msg_id,
+                    "text": screen.text,
+                    "parse_mode": screen.parse_mode,
+                    "disable_web_page_preview": True,
+                    "reply_markup": screen.reply_markup,
+                },
+            )
+            if isinstance(edit_res, dict) and edit_res.get("ok") is False:
+                desc = str(edit_res.get("description") or "").lower()
+                if "message is not modified" in desc:
+                    return screen
+                sent = await sender(
+                    chat_id,
+                    screen.text,
+                    screen.reply_markup,
+                )
+                if isinstance(sent, dict) and isinstance(sent.get("result"), dict):
+                    new_id = sent["result"].get("message_id")
+                    if new_id:
+                        await self.set_anchor_id(user_id, int(new_id), session=session)
+            return screen
+
+        sent = await sender(
+            chat_id,
+            screen.text,
+            screen.reply_markup,
+        )
+        if isinstance(sent, dict) and isinstance(sent.get("result"), dict):
+            new_id = sent["result"].get("message_id")
+            if new_id:
+                await self.set_anchor_id(user_id, int(new_id), session=session)
+        return screen
+
+
+# ===================== AITU-Style Onboarding & Wizard Screens =====================
+
+def get_club_info_screen() -> Screen:
+    """Screen: Welcome / About Sunday Open Hub for unregistered users."""
+    text = (
+        "🚀 <b>Добро пожаловать в Sunday Open · Проекты!</b>\n\n"
+        "<b>Sunday Open Hub</b> — единая проектная экосистема студенческих клубов и инициатив. "
+        "Здесь клубы подают идеи мероприятий, защищают паспорта проектов и ведут общий календарь событий!\n\n"
+        "✨ <b>Что дает регистрация:</b>\n"
+        "• Подача идей и бронирование дат через интерактивный Anchor Wizard\n"
+        "• Доступ к банку идей и календарю всех мероприятий\n"
+        "• Личный профиль организатора и выгрузка списков участников (CSV)\n\n"
+        "Чтобы начать пользоваться платформой, пройдите быструю регистрацию 👇"
+    )
+    rows: list[list[dict[str, Any]]] = [
+        [{"text": "📝 Пройти регистрацию", "callback_data": "auth:start_reg"}],
+        [{"text": "💡 Банк идей", "callback_data": "nav:open:ideas"}],
+        [{"text": "📅 Календарь событий", "callback_data": "nav:open:calendar"}],
+    ]
+    webapp_btn = tg_webapp_button("🌐 Открыть Hub (Web App)")
+    if webapp_btn:
+        rows.append([webapp_btn])
+    return Screen(
+        text=text,
+        reply_markup={"inline_keyboard": rows},
+        title="🏠 Главная",
+    )
+
+
+def get_authorized_menu_screen(
+    full_name: str,
+    club: str = "",
+    role: str = "Участник",
+    is_mod: bool = False,
+    reminders_on: bool = True,
+) -> Screen:
+    """Screen: Main Authorized Hub Menu with role-based layout."""
+    if is_mod:
+        status_label = f"Staff / Модератор ({role}) 🛡️"
+    elif role == "Организатор":
+        status_label = "Организатор клуба ⚔️"
+    elif role == "Волонтёр":
+        status_label = "Волонтёр 🤝"
+    else:
+        status_label = "Участник 🎓"
+
+    club_line = f"🏛 Клуб: <b>{tg_esc(club)}</b>\n" if club else ""
+    text = (
+        "🚀 <b>Sunday Open · Проекты — Главное меню</b>\n\n"
+        f"Добро пожаловать, <b>{tg_esc(full_name or 'Участник')}</b>!\n"
+        f"{club_line}"
+        f"🔰 Статус аккаунта: <b>{status_label}</b>\n\n"
+        "Выберите раздел:"
+    )
+
+    rem_status = "🔔 Напоминания: Вкл" if reminders_on else "🔕 Напоминания: Выкл"
+    rows: list[list[dict[str, Any]]] = [
+        [{"text": "💡 Подать идею (Anchor Wizard)", "callback_data": "wiz:new_idea"}],
+        [{"text": "📚 Банк идей", "callback_data": "nav:open:ideas"}],
+        [{"text": "📅 Календарь событий", "callback_data": "nav:open:calendar"}],
+    ]
+
+    if role == "Организатор" or is_mod:
+        rows.append([{"text": "📋 Списки участников (CSV)", "callback_data": "nav:open:list"}])
+
+    if is_mod:
+        rows.append([{"text": "🛡 Очередь модерации", "callback_data": "nav:open:moderation"}])
+
+    rows.append([{"text": "👤 Мой профиль", "callback_data": "nav:open:profile"}])
+    rows.append([{"text": rem_status, "callback_data": "act:toggle_remind"}])
+
+    webapp_btn = tg_webapp_button("🌐 Открыть Sunday Open Web Hub")
+    if webapp_btn:
+        rows.append([webapp_btn])
+
+    return Screen(
+        text=text,
+        reply_markup={"inline_keyboard": rows},
+        title="🏠 Главная",
+    )
+
+
+def get_choose_role_screen() -> Screen:
+    """State: CHOOSE_ROLE - Select club status: Организатор, Участник, Волонтёр."""
+    text = (
+        "👤 <b>Выберите ваш статус в клубе:</b>\n\n"
+        "Пожалуйста, укажите вашу роль для настройки профиля:\n\n"
+        "⚔️ <b>Организатор</b>\n"
+        "— Для руководителей и координаторов студенческих клубов\n"
+        "— Подача идей, паспорт проекта и выгрузка списков участников (CSV)\n\n"
+        "🎓 <b>Участник</b>\n"
+        "— Для студентов и гостей мероприятий\n"
+        "— Запись на события (RSVP), чекин по QR-коду и дайджест событий\n\n"
+        "🤝 <b>Волонтёр</b>\n"
+        "— Для команды помощи в проведении мероприятий на площадке"
+    )
+    rows = [
+        [{"text": "⚔️ Организатор", "callback_data": "auth:role:Организатор"}],
+        [{"text": "🎓 Участник", "callback_data": "auth:role:Участник"}],
+        [{"text": "🤝 Волонтёр", "callback_data": "auth:role:Волонтёр"}],
+        [{"text": "◀️ Назад", "callback_data": "nav:home"}],
+    ]
+    return Screen(text=text, reply_markup={"inline_keyboard": rows}, title="👤 Роль")
+
+
+def get_full_name_screen(role: str = "Участник", error_msg: str | None = None) -> Screen:
+    """State: INPUT_FULL_NAME - Prompt for full name."""
+    err_block = f"{error_msg}\n\n" if error_msg else ""
+    text = (
+        f"{err_block}"
+        "📝 <b>Введите ФИО (Шаг 1 из 4)</b>\n\n"
+        f"Роль: <b>{tg_esc(role)}</b> ✅\n\n"
+        "Отправьте ваше <b>Имя и Фамилию</b> ответным сообщением в чат.\n\n"
+        "⚠️ <i>Требования: минимум 2 слова. Ваше сообщение будет удалено сборщиком мусора, экран обновится на месте.</i>\n"
+        "<i>Пример: Алихан Болатов</i>"
+    )
+    rows = [[{"text": "🚫 Отмена", "callback_data": "auth:cancel"}]]
+    return Screen(text=text, reply_markup={"inline_keyboard": rows}, title="📝 ФИО")
+
+
+def get_phone_screen(role: str, full_name: str, error_msg: str | None = None) -> Screen:
+    """State: INPUT_PHONE - Prompt for phone number with contact button info."""
+    err_block = f"{error_msg}\n\n" if error_msg else ""
+    text = (
+        f"{err_block}"
+        "📱 <b>Отправьте номер телефона (Шаг 2 из 4)</b>\n\n"
+        f"Роль: <b>{tg_esc(role)}</b> ✅\n"
+        f"ФИО: <b>{tg_esc(full_name)}</b> ✅\n\n"
+        "Нажмите кнопку <b>«📱 Поделиться контактом»</b> внизу экрана "
+        "или напишите номер вручную в международном формате E.164 (например, <code>+77011234567</code>):"
+    )
+    rows = [[{"text": "🚫 Отмена", "callback_data": "auth:cancel"}]]
+    return Screen(text=text, reply_markup={"inline_keyboard": rows}, title="📱 Телефон")
+
+
+def get_phone_reply_keyboard() -> dict[str, Any]:
+    """Reply markup with Share Contact button."""
+    return {
+        "keyboard": [
+            [{"text": "📱 Поделиться контактом", "request_contact": True}],
+        ],
+        "resize_keyboard": True,
+        "one_time_keyboard": True,
+    }
+
+
+def get_email_screen(role: str, full_name: str, phone: str, error_msg: str | None = None) -> Screen:
+    """State: INPUT_EMAIL - Prompt for email address."""
+    err_block = f"{error_msg}\n\n" if error_msg else ""
+    text = (
+        f"{err_block}"
+        "📧 <b>Введите адрес электронной почты (Шаг 3 из 4)</b>\n\n"
+        f"Роль: <b>{tg_esc(role)}</b> ✅\n"
+        f"ФИО: <b>{tg_esc(full_name)}</b> ✅\n"
+        f"Телефон: <code>{tg_esc(phone)}</code> ✅\n\n"
+        "Введите адрес вашей электронной почты для связи и уведомлений:\n\n"
+        "<i>Пример: student@astanait.edu.kz или user@gmail.com</i>"
+    )
+    rows = [
+        [
+            {"text": "⏭️ Пропустить", "callback_data": "auth:skip_email"},
+            {"text": "🚫 Отмена", "callback_data": "auth:cancel"},
+        ]
+    ]
+    return Screen(text=text, reply_markup={"inline_keyboard": rows}, title="📧 Email")
+
+
+def get_club_screen(
+    role: str,
+    full_name: str,
+    phone: str,
+    email: str = "",
+    error_msg: str | None = None,
+) -> Screen:
+    """State: INPUT_CLUB - Prompt for club name."""
+    err_block = f"{error_msg}\n\n" if error_msg else ""
+    email_disp = email if email else "не указан"
+    text = (
+        f"{err_block}"
+        "🏛 <b>Название вашего клуба (Шаг 4 из 4)</b>\n\n"
+        f"Роль: <b>{tg_esc(role)}</b> ✅\n"
+        f"ФИО: <b>{tg_esc(full_name)}</b> ✅\n"
+        f"Телефон: <code>{tg_esc(phone)}</code> ✅\n"
+        f"Email: <code>{tg_esc(email_disp)}</code> ✅\n\n"
+        "Напишите название студенческого клуба или команды, которую вы представляете:\n\n"
+        "<i>Пример: AITU Gaming, Music Club, Debate Club</i>"
+    )
+    rows = [[{"text": "🚫 Отмена", "callback_data": "auth:cancel"}]]
+    return Screen(text=text, reply_markup={"inline_keyboard": rows}, title="🏛 Клуб")
+
+
+def get_registration_cancelled_screen() -> Screen:
+    """Screen: Registration Cancelled."""
+    text = (
+        "❌ <b>Регистрация отменена</b>\n\n"
+        "Все введенные данные были сброшены. Вы можете начать процесс заново в любое удобное время."
+    )
+    rows = [
+        [{"text": "📝 Пройти регистрацию", "callback_data": "auth:start_reg"}],
+        [{"text": "🏠 Главное меню", "callback_data": "nav:home"}],
+    ]
+    return Screen(text=text, reply_markup={"inline_keyboard": rows}, title="❌ Отменено")
+
+
+def get_wizard_step_screen(
+    d: dict[str, Any],
+    error_msg: str | None = None,
+    occupied_dates: set[str] | None = None,
+    today_iso: str | None = None,
+) -> Screen:
+    """Render 5W1H Idea Anchor Wizard step with progress summary & slot picker."""
+    step_idx = int(d.get("step", 0))
+    row_data = d.get("row") or {}
+    field_key, prompt_text = TG_STEPS[step_idx]
+    user_club = str(d.get("user_club") or "").strip()
+
+    err_block = f"{error_msg}\n\n" if error_msg else ""
+    lines = [
+        f"{err_block}💡 <b>Подача идеи проекта (Шаг {step_idx + 1} из {len(TG_STEPS)})</b>",
+        "",
+    ]
+
+    # Show already filled fields with checkmarks
+    for idx in range(step_idx):
+        k, _ = TG_STEPS[idx]
+        val = row_data.get(k)
+        label = TG_LABELS.get(k, k)
+        if val:
+            disp = tg_date_fmt(val) if k == "date" else tg_cut(str(val), 80)
+            lines.append(f"• {tg_esc(label)}: <b>{tg_esc(disp)}</b> ✅")
+
+    if step_idx > 0 and any(row_data.get(TG_STEPS[i][0]) for i in range(step_idx)):
+        lines.append("")
+
+    lines.append(f"👉 <b>{tg_esc(prompt_text)}</b>")
+    lines.append("")
+    lines.append("<i>💡 Отправьте ответ сообщением в чат (оно будет удалено сборщиком мусора, а экран обновится на месте).</i>")
+
+    kb_rows: list[list[dict[str, Any]]] = []
+
+    # Quick-pick user's registered club on Step 2 ('club')
+    if field_key == "club" and user_club:
+        kb_rows.append([
+            {"text": f"🏛 Выбрать мой клуб: {tg_cut(user_club, 26)}", "callback_data": "wiz:use_club"}
+        ])
+
+    # Interactive 14-day slot picker on Step 3 ('date'), just like aitu-gaming-hub
+    if field_key == "date":
+        lines.append("\n📅 <b>Или выберите свободную дату нажатием кнопки:</b>\n🟢 — Свободно | 🔴 — Есть события")
+        try:
+            base_day = (
+                date.fromisoformat(today_iso) if today_iso else date.today()
+            ) + timedelta(days=28)
+        except Exception:
+            base_day = date.today() + timedelta(days=28)
+
+        occ = occupied_dates or set()
+        slot_row: list[dict[str, Any]] = []
+        for i in range(10):
+            slot_d = base_day + timedelta(days=i)
+            iso_s = slot_d.isoformat()
+            d_label = slot_d.strftime("%d.%m")
+            badge = "🔴" if iso_s in occ else "🟢"
+            slot_row.append({"text": f"{d_label} {badge}", "callback_data": f"wiz:date:{iso_s}"})
+            if len(slot_row) == 2:
+                kb_rows.append(slot_row)
+                slot_row = []
+        if slot_row:
+            kb_rows.append(slot_row)
+
+    # Navigation controls
+    nav_row: list[dict[str, Any]] = []
+    if step_idx > 0:
+        nav_row.append({"text": "◀️ Назад", "callback_data": "wiz:prev"})
+        nav_row.append({"text": "⏭️ Пропустить шаг", "callback_data": "wiz:skip"})
+    if nav_row:
+        kb_rows.append(nav_row)
+
+    kb_rows.append([{"text": "🚫 Отмена", "callback_data": "wiz:cancel"}])
+
+    return Screen(
+        text="\n".join(lines),
+        reply_markup={"inline_keyboard": kb_rows},
+        title=f"💡 Шаг {step_idx + 1}/{len(TG_STEPS)}",
+    )
+
+
+def get_wizard_confirm_screen(d: dict[str, Any]) -> Screen:
+    """Step 10: Final review card before submitting idea to headquarters."""
+    row_data = d.get("row") or {}
+    lines = ["📋 <b>Проверьте заявку перед отправкой</b>", ""]
+    for s_key, _ in TG_STEPS:
+        val = row_data.get(s_key)
+        if not val:
+            continue
+        display_val = tg_date_fmt(val) if s_key == "date" else val
+        lines.append(
+            f"• <b>{tg_esc(TG_LABELS.get(s_key, s_key))}:</b> {tg_esc(display_val)}"
+        )
+    lines.append("")
+    lines.append("Отправить карточку проекта на согласование в штаб Sunday Open?")
+
+    kb_rows = [
+        [{"text": "🚀 Отправить в штаб", "callback_data": "n:send"}],
+        [
+            {"text": "◀️ Назад", "callback_data": "wiz:prev"},
+            {"text": "🔄 С начала", "callback_data": "wiz:new_idea"},
+        ],
+        [{"text": "❌ Отмена", "callback_data": "n:cancel"}],
+    ]
+    return Screen(
+        text="\n".join(lines),
+        reply_markup={"inline_keyboard": kb_rows},
+        title="📋 Проверка заявки",
+    )
+
+
+def get_wizard_submitted_screen(card_id: str, title: str, is_pending: bool) -> Screen:
+    """Screen rendered into creator's anchor after submitting idea."""
+    status_badge = (
+        "🟡 На рассмотрении в штабе (уведомлю в этом чате после проверки)"
+        if is_pending
+        else "🟢 Опубликовано в банке идей"
+    )
+    text = (
+        "✅ <b>Заявка успешно отправлена!</b>\n\n"
+        f"• <b>Проект:</b> <b>{tg_esc(title)}</b>\n"
+        f"• <b>Статус:</b> {status_badge}\n\n"
+        "Карточку можно дополнить в портале: паспорт, контакты, детали."
+    )
+    kb_rows: list[list[dict[str, Any]]] = []
+    btn = tg_webapp_button("🌐 Открыть карточку в Web Hub", f"sel={quote(card_id)}")
+    if btn:
+        kb_rows.append([btn])
+    kb_rows.append([{"text": "💡 Банк идей", "callback_data": "nav:open:ideas"}])
+    kb_rows.append([{"text": "🏠 Главное меню", "callback_data": "nav:home"}])
+    return Screen(
+        text=text,
+        reply_markup={"inline_keyboard": kb_rows},
+        title="✅ Отправлено",
+    )
+
 
 # ===================== Built-in Screen Renderers =====================
 
@@ -429,44 +839,40 @@ async def render_home_screen(
     _chat_id: int | str,
     _payload: dict[str, Any],
 ) -> Screen:
+    contact = (
+        await session.execute(
+            select(Contact).where(Contact.tg_id == str(user_id))
+        )
+    ).scalar_one_or_none()
     bot_user = (
         await session.execute(
             select(BotUser).where(BotUser.tg_id == str(user_id))
         )
     ).scalar_one_or_none()
     reminders_on = bool(bot_user.reminders) if bot_user else True
-    rem_status = "🔔 Напоминания: Вкл" if reminders_on else "🔕 Напоминания: Выкл"
+    is_mod = await is_tg_moderator(session, user_id)
 
-    text = (
-        "<b>Sunday Open · Проекты</b>\n\n"
-        "Интерактивное меню управления проектами, идеями и событиями.\n"
-        "Выберите действие кнопками ниже:"
-    )
-    rows: list[list[dict[str, Any]]] = [
-        [
-            {"text": "💡 Подать идею", "callback_data": "act:new_idea"},
-            {"text": "📚 Банк идей", "callback_data": "nav:open:ideas"},
-        ],
-        [
-            {"text": "📅 Календарь", "callback_data": "nav:open:calendar"},
-            {"text": "👤 Профиль", "callback_data": "nav:open:profile"},
-        ],
-        [
-            {"text": "📋 Списки", "callback_data": "nav:open:list"},
-            {"text": rem_status, "callback_data": "act:toggle_remind"},
-        ],
-    ]
-    if await is_tg_moderator(session, user_id):
-        rows.append([{"text": "🛡 Очередь модерации", "callback_data": "nav:open:moderation"}])
+    if contact and (contact.first_name or contact.club):
+        p = contact_to_profile(contact)
+        return get_authorized_menu_screen(
+            full_name=full_name_from_profile(p),
+            club=p.get("club") or "",
+            role=p.get("role") or "Участник",
+            is_mod=is_mod,
+            reminders_on=reminders_on,
+        )
 
-    webapp_btn = tg_webapp_button("🌐 Открыть портал")
-    if webapp_btn:
-        rows.append([webapp_btn])
-    return Screen(
-        text=text,
-        reply_markup={"inline_keyboard": rows},
-        title="🏠 Главная",
-    )
+    # Even if unregistered, if user is moderator show authorized menu
+    if is_mod:
+        return get_authorized_menu_screen(
+            full_name=bot_user.name if bot_user else "Модератор",
+            club="Штаб Sunday Open",
+            role="Организатор",
+            is_mod=True,
+            reminders_on=reminders_on,
+        )
+
+    return get_club_info_screen()
 
 
 async def render_ideas_screen(
@@ -478,7 +884,7 @@ async def render_ideas_screen(
     portal_rows = await get_portal_rows(session)
     text, base_kb = format_ideas_text(portal_rows)
     kb_rows: list[list[dict[str, Any]]] = [
-        [{"text": "💡 Подать новую идею", "callback_data": "act:new_idea"}]
+        [{"text": "💡 Подать идею (Anchor Wizard)", "callback_data": "wiz:new_idea"}]
     ]
     if base_kb and isinstance(base_kb.get("inline_keyboard"), list):
         for r in base_kb["inline_keyboard"]:
@@ -649,14 +1055,14 @@ async def render_profile_screen(
 
     p = contact_to_profile(contact)
     miss = get_missing_profile_fields(p)
-    if not contact:
+    if not contact or not (contact.first_name or contact.club):
         text = (
-            "<b>Профиль участника</b>\n\n"
+            "👤 <b>Профиль участника Sunday Open</b>\n\n"
             "Вы ещё не зарегистрированы в клубе.\n"
-            "Нажмите «📱 Зарегистрироваться» ниже для быстрой привязки контакта."
+            "Нажмите <b>«📝 Пройти регистрацию»</b> ниже для быстрой настройки профиля."
         )
         kb_rows = [
-            [{"text": "📱 Зарегистрироваться", "callback_data": "act:register"}],
+            [{"text": "📝 Пройти регистрацию", "callback_data": "auth:start_reg"}],
             [{"text": rem_status, "callback_data": "act:toggle_remind"}],
         ]
     else:
@@ -666,18 +1072,19 @@ async def render_profile_screen(
             else "✅ Профиль полностью заполнен"
         )
         text = (
-            f"<b>Профиль участника</b>\n{status_str}\n\n"
-            f"<b>Имя:</b> {tg_esc(full_name_from_profile(p) or '—')}\n"
-            f"<b>Клуб:</b> {tg_esc(p.get('club') or '—')}\n"
-            f"<b>Роль:</b> {tg_esc(p.get('role') or '—')}\n"
-            f"<b>Телефон:</b> {tg_esc(p.get('phone') or '—')}\n"
-            f"<b>Email:</b> {tg_esc(p.get('email') or '—')}"
+            f"👤 <b>Профиль участника Sunday Open</b>\n{status_str}\n\n"
+            f"• ФИО: <b>{tg_esc(full_name_from_profile(p) or '—')}</b>\n"
+            f"• Клуб: <b>{tg_esc(p.get('club') or '—')}</b>\n"
+            f"• Роль: <b>{tg_esc(p.get('role') or '—')}</b>\n"
+            f"• Телефон: <code>{tg_esc(p.get('phone') or '—')}</code>\n"
+            f"• Email: <code>{tg_esc(p.get('email') or '—')}</code>\n"
+            f"• Уведомления: <b>{'Включены 🔔' if reminders_on else 'Выключены 🔕'}</b>"
         )
         kb_rows = [
-            [{"text": "✏️ Изменить профиль", "callback_data": "act:register"}],
+            [{"text": "📝 Изменить данные профиля", "callback_data": "auth:start_reg"}],
             [{"text": rem_status, "callback_data": "act:toggle_remind"}],
         ]
-    btn = tg_webapp_button("🌐 Открыть профиль в портале", "tab=me")
+    btn = tg_webapp_button("🌐 Открыть профиль в Web Hub", "tab=me")
     if btn:
         kb_rows.append([btn])
     return Screen(

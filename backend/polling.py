@@ -73,19 +73,12 @@ async def init_bot_profile(token: str) -> None:
                             await set_kv(s, "TG_MOD_CODE", code)
                         logger.info("Telegram moderator code: /mod %s", code)
 
-            # Set commands
+            # Set commands (matching aitu-gaming-hub single-entry command menu)
             await client.post(
                 f"https://api.telegram.org/bot{token}/setMyCommands",
                 json={
                     "commands": [
-                        {"command": "menu", "description": "Интерактивное меню (Anchor UI)"},
-                        {"command": "register", "description": "Регистрация и контакты"},
-                        {"command": "new", "description": "Подать идею"},
-                        {"command": "ideas", "description": "Банк идей"},
-                        {"command": "calendar", "description": "Ближайшие события"},
-                        {"command": "list", "description": "Списки участников"},
-                        {"command": "remind", "description": "Напоминания вкл/выкл"},
-                        {"command": "help", "description": "Что умеет бот"},
+                        {"command": "start", "description": "🏠 Главное меню Sunday Open Hub"},
                     ]
                 },
             )
@@ -97,7 +90,7 @@ async def init_bot_profile(token: str) -> None:
                     json={
                         "menu_button": {
                             "type": "web_app",
-                            "text": "Портал",
+                            "text": "🌐 Hub",
                             "web_app": {"url": settings.TG_WEBAPP_URL},
                         }
                     },

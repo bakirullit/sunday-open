@@ -1058,13 +1058,54 @@ async def handle_reg_step(
     return await sender(chat_id, "Выберите роль кнопкой выше.")
 
 
+async def garbage_collect_message(
+    chat_id: int | str,
+    message_id: int | None,
+    api_caller: Callable[..., Awaitable[Any]] = send_tg_api,
+) -> None:
+    """
+    Intercepts user messages in private chat and immediately deletes them
+    so the chat remains spotless and only the Single Persistent Anchor Message
+    is visible (matching aitu-gaming-hub GarbageCollectorMiddleware).
+    """
+    if not message_id:
+        return
+    try:
+        await api_caller(
+            "deleteMessage",
+            {"chat_id": chat_id, "message_id": int(message_id)},
+        )
+    except Exception:
+        pass
+
+
+async def clean_contact_markup(
+    chat_id: int | str,
+    d: dict[str, Any],
+    api_caller: Callable[..., Awaitable[Any]] = send_tg_api,
+) -> None:
+    """Delete temporary request_contact reply keyboard message if one was sent."""
+    phone_msg_id = d.get("phone_reply_msg_id")
+    if phone_msg_id:
+        try:
+            await api_caller(
+                "deleteMessage",
+                {"chat_id": chat_id, "message_id": int(phone_msg_id)},
+            )
+        except Exception:
+            pass
+        d.pop("phone_reply_msg_id", None)
+
+
 async def handle_on_contact(
     session: AsyncSession,
     msg: dict[str, Any],
     state_store: StateStore = default_state_store,
     send_msg_fn: Callable[..., Awaitable[Any]] | None = None,
+    send_api_fn: Callable[..., Awaitable[Any]] | None = None,
 ) -> Any:
     sender = send_msg_fn or send_tg_message
+    api_caller = send_api_fn or send_tg_api
     chat_id = msg["chat"]["id"]
     from_user = msg["from"]
     ct = msg["contact"]
@@ -1088,6 +1129,27 @@ async def handle_on_contact(
     if raw_d:
         d = json.loads(raw_d)
         if d.get("step") == "phone":
+            if d.get("anchor_mode"):
+                await clean_contact_markup(chat_id, d, api_caller)
+                d["p"]["phone"] = ct.get("phone_number") or ""
+                d["step"] = "email"
+                await state_store.put(rkey, json.dumps(d), ttl=21600)
+                from backend.anchor_ui import create_default_navigator, get_email_screen
+
+                nav = create_default_navigator(state_store=state_store)
+                full_name = f"{d['p'].get('firstName', '')} {d['p'].get('lastName', '')}".strip()
+                return await nav.render_screen(
+                    session=session,
+                    user_id=from_user["id"],
+                    chat_id=chat_id,
+                    screen=get_email_screen(
+                        role=d["p"].get("role", "Участник"),
+                        full_name=full_name,
+                        phone=d["p"]["phone"],
+                    ),
+                    send_msg_fn=sender,
+                    send_api_fn=api_caller,
+                )
             return await handle_reg_step(
                 chat_id,
                 from_user,
@@ -1111,6 +1173,178 @@ async def handle_on_contact(
     )
 
 
+async def handle_anchor_reg_step(
+    session: AsyncSession,
+    chat_id: int | str,
+    from_user: dict[str, Any],
+    d: dict[str, Any],
+    text: str,
+    state_store: StateStore = default_state_store,
+    send_msg_fn: Callable[..., Awaitable[Any]] | None = None,
+    send_api_fn: Callable[..., Awaitable[Any]] | None = None,
+) -> Any:
+    """In-place Anchor Wizard registration handler matching aitu-gaming-hub onboarding."""
+    sender = send_msg_fn or send_tg_message
+    api_caller = send_api_fn or send_tg_api
+    rkey = f"tgr{chat_id}"
+    uid = from_user["id"]
+    step = d.get("step")
+
+    from backend.anchor_ui import (
+        create_default_navigator,
+        get_club_screen,
+        get_email_screen,
+        get_full_name_screen,
+        get_phone_reply_keyboard,
+        get_phone_screen,
+    )
+
+    nav = create_default_navigator(state_store=state_store)
+    role_val = d.get("p", {}).get("role", "Участник")
+    full_name_val = f"{d.get('p', {}).get('firstName', '')} {d.get('p', {}).get('lastName', '')}".strip()
+    phone_val = d.get("p", {}).get("phone", "")
+    email_val = d.get("p", {}).get("email", "")
+
+    if step == "name":
+        parts = [p for p in text.split() if p]
+        if len(parts) < 2 or len(text) < 3:
+            return await nav.render_screen(
+                session=session,
+                user_id=uid,
+                chat_id=chat_id,
+                screen=get_full_name_screen(
+                    role=role_val,
+                    error_msg="❌ Пожалуйста, введите полные Имя и Фамилию (минимум 2 слова).",
+                ),
+                send_msg_fn=sender,
+                send_api_fn=api_caller,
+            )
+        d["p"]["firstName"] = tg_cut(parts[0], 60)
+        d["p"]["lastName"] = tg_cut(" ".join(parts[1:]), 80)
+        full_name_val = f"{d['p']['firstName']} {d['p']['lastName']}".strip()
+        d["step"] = "phone"
+        # Send temporary request_contact reply keyboard prompt and record its message_id
+        res_msg = await api_caller(
+            "sendMessage",
+            {
+                "chat_id": chat_id,
+                "text": "👇 Нажмите кнопку ниже, чтобы поделиться номером:",
+                "reply_markup": get_phone_reply_keyboard(),
+            },
+        )
+        if isinstance(res_msg, dict) and isinstance(res_msg.get("result"), dict):
+            d["phone_reply_msg_id"] = res_msg["result"].get("message_id")
+        await state_store.put(rkey, json.dumps(d), ttl=21600)
+        return await nav.render_screen(
+            session=session,
+            user_id=uid,
+            chat_id=chat_id,
+            screen=get_phone_screen(role=role_val, full_name=full_name_val),
+            send_msg_fn=sender,
+            send_api_fn=api_caller,
+        )
+
+    if step == "phone":
+        cleaned_phone = re.sub(r"[\s\-\(\)]", "", text)
+        if not re.match(r"^\+?\d{10,15}$", cleaned_phone):
+            return await nav.render_screen(
+                session=session,
+                user_id=uid,
+                chat_id=chat_id,
+                screen=get_phone_screen(
+                    role=role_val,
+                    full_name=full_name_val,
+                    error_msg="❌ Неверный формат номера. Нажмите кнопку «📱 Поделиться контактом» или введите номер в формате +77001234567.",
+                ),
+                send_msg_fn=sender,
+                send_api_fn=api_caller,
+            )
+        await clean_contact_markup(chat_id, d, api_caller)
+        await upsert_bot_user(session, from_user)
+        await save_contact(session, from_user, {"phone": cleaned_phone}, trusted=True)
+        d["p"]["phone"] = cleaned_phone
+        d["step"] = "email"
+        await state_store.put(rkey, json.dumps(d), ttl=21600)
+        return await nav.render_screen(
+            session=session,
+            user_id=uid,
+            chat_id=chat_id,
+            screen=get_email_screen(
+                role=role_val, full_name=full_name_val, phone=cleaned_phone
+            ),
+            send_msg_fn=sender,
+            send_api_fn=api_caller,
+        )
+
+    if step == "email":
+        if text not in ("-", "—"):
+            if not EMAIL_RE.match(text):
+                return await nav.render_screen(
+                    session=session,
+                    user_id=uid,
+                    chat_id=chat_id,
+                    screen=get_email_screen(
+                        role=role_val,
+                        full_name=full_name_val,
+                        phone=phone_val,
+                        error_msg="❌ Неверный формат Email. Попробуйте ещё раз или нажмите «⏭️ Пропустить».",
+                    ),
+                    send_msg_fn=sender,
+                    send_api_fn=api_caller,
+                )
+            d["p"]["email"] = tg_cut(text, 120)
+            email_val = d["p"]["email"]
+        d["step"] = "club"
+        await state_store.put(rkey, json.dumps(d), ttl=21600)
+        return await nav.render_screen(
+            session=session,
+            user_id=uid,
+            chat_id=chat_id,
+            screen=get_club_screen(
+                role=role_val,
+                full_name=full_name_val,
+                phone=phone_val,
+                email=email_val,
+            ),
+            send_msg_fn=sender,
+            send_api_fn=api_caller,
+        )
+
+    if step == "club":
+        if not text or len(text.strip()) < 2 or text.strip() == "-":
+            return await nav.render_screen(
+                session=session,
+                user_id=uid,
+                chat_id=chat_id,
+                screen=get_club_screen(
+                    role=role_val,
+                    full_name=full_name_val,
+                    phone=phone_val,
+                    email=email_val,
+                    error_msg="❌ Пожалуйста, укажите название клуба или организации.",
+                ),
+                send_msg_fn=sender,
+                send_api_fn=api_caller,
+            )
+        d["p"]["club"] = tg_cut(text.strip(), 120)
+        await upsert_bot_user(session, from_user)
+        await save_contact(session, from_user, d["p"], trusted=False)
+        await state_store.remove(rkey)
+        await nav.reset_history(uid, session=session)
+        return await nav.navigate(
+            session=session,
+            user_id=uid,
+            chat_id=chat_id,
+            screen_id="home",
+            payload={},
+            push_to_history=True,
+            send_msg_fn=sender,
+            send_api_fn=api_caller,
+        )
+
+    return None
+
+
 async def handle_new_dialog_step(
     chat_id: int | str,
     from_user: dict[str, Any],
@@ -1118,24 +1352,106 @@ async def handle_new_dialog_step(
     text: str,
     state_store: StateStore = default_state_store,
     send_msg_fn: Callable[..., Awaitable[Any]] | None = None,
+    send_api_fn: Callable[..., Awaitable[Any]] | None = None,
     today_iso: str | None = None,
+    session: AsyncSession | None = None,
 ) -> Any:
     sender = send_msg_fn or send_tg_message
+    api_caller = send_api_fn or send_tg_api
     dkey = f"tgd{chat_id}"
     step_idx = int(d.get("step", 0))
     field_name = TG_STEPS[step_idx][0]
-    skip = text in ("-", "—")
+    skip = text in ("-", "—", "⏩ пропустить", "пропустить")
+    anchor_mode = bool(d.get("anchor_mode"))
 
+    if anchor_mode:
+        from backend.anchor_ui import (
+            create_default_navigator,
+            get_wizard_confirm_screen,
+            get_wizard_step_screen,
+        )
+
+        nav = create_default_navigator(state_store=state_store)
+        uid = from_user["id"]
+        occ: set[str] = set()
+        if session is not None:
+            portal_rows = await get_portal_rows(session)
+            occ = {
+                str(r["date"])
+                for r in portal_rows
+                if r.get("date") and r.get("stage") not in ("Отклонена", "Закрыт")
+            }
+
+        if field_name == "title" and skip:
+            return await nav.render_screen(
+                session=session,
+                user_id=uid,
+                chat_id=chat_id,
+                screen=get_wizard_step_screen(
+                    d,
+                    error_msg="❌ Название события обязательно. Пожалуйста, напишите его.",
+                    occupied_dates=occ,
+                    today_iso=today_iso,
+                ),
+                send_msg_fn=sender,
+                send_api_fn=api_caller,
+            )
+
+        if field_name == "date" and not skip:
+            iso = tg_parse_date(text, today_iso=today_iso)
+            if not iso:
+                return await nav.render_screen(
+                    session=session,
+                    user_id=uid,
+                    chat_id=chat_id,
+                    screen=get_wizard_step_screen(
+                        d,
+                        error_msg="❌ Не удалось распознать дату. Выберите слот на кнопке ниже или напишите в формате ДД.ММ (например, 15.11).",
+                        occupied_dates=occ,
+                        today_iso=today_iso,
+                    ),
+                    send_msg_fn=sender,
+                    send_api_fn=api_caller,
+                )
+            d["row"]["date"] = iso
+        elif not skip:
+            d["row"][field_name] = tg_cut(text, 2000)
+
+        d["step"] = step_idx + 1
+        await state_store.put(dkey, json.dumps(d), ttl=21600)
+        if d["step"] < len(TG_STEPS):
+            return await nav.render_screen(
+                session=session,
+                user_id=uid,
+                chat_id=chat_id,
+                screen=get_wizard_step_screen(
+                    d, occupied_dates=occ, today_iso=today_iso
+                ),
+                send_msg_fn=sender,
+                send_api_fn=api_caller,
+            )
+        return await nav.render_screen(
+            session=session,
+            user_id=uid,
+            chat_id=chat_id,
+            screen=get_wizard_confirm_screen(d),
+            send_msg_fn=sender,
+            send_api_fn=api_caller,
+        )
+
+    # Legacy command-mode /new dialog for contract compatibility
     if field_name == "title" and skip:
         return await sender(
-            chat_id, f"Без названия не получится. {TG_STEPS[0][1]}"
+            chat_id,
+            f"Без названия не получится. {TG_STEPS[0][1]}",
         )
 
     if field_name == "date" and not skip:
         iso = tg_parse_date(text, today_iso=today_iso)
         if not iso:
             return await sender(
-                chat_id, "Не разобрал дату. Напишите, например, 15.11 или «-»."
+                chat_id,
+                "Не разобрал дату. Напишите, например, 15.11 или отправьте «-».",
             )
         d["row"]["date"] = iso
         left = tg_days_from_today(iso, today_iso=today_iso)
@@ -1183,16 +1499,25 @@ async def handle_tg_message(
     msg: dict[str, Any],
     state_store: StateStore = default_state_store,
     send_msg_fn: Callable[..., Awaitable[Any]] | None = None,
+    send_api_fn: Callable[..., Awaitable[Any]] | None = None,
     today_iso: str | None = None,
 ) -> Any:
     sender = send_msg_fn or send_tg_message
+    api_caller = send_api_fn or send_tg_api
     chat_id = msg["chat"]["id"]
     from_user = msg["from"]
     text = str(msg.get("text") or "").strip()
 
+    # GarbageCollector: delete user's message in private chat to keep single-anchor UX clean
+    await garbage_collect_message(chat_id, msg.get("message_id"), api_caller)
+
     if msg.get("contact"):
         return await handle_on_contact(
-            session, msg, state_store=state_store, send_msg_fn=sender
+            session,
+            msg,
+            state_store=state_store,
+            send_msg_fn=sender,
+            send_api_fn=api_caller,
         )
 
     m = CMD_RE.match(text)
@@ -1201,92 +1526,69 @@ async def handle_tg_message(
     dkey = f"tgd{chat_id}"
     rkey = f"tgr{chat_id}"
 
+    # QR Checkin
     if cmd_name == "start" and CHECKIN_ARG_RE.match(cmd_arg):
         return await handle_qr_checkin(
             session, chat_id, from_user, cmd_arg[3:], send_msg_fn=sender
         )
 
-    if (cmd_name == "start" and cmd_arg == "reg") or cmd_name == "register":
-        return await handle_reg_start(
-            chat_id, from_user, state_store=state_store, send_msg_fn=sender
-        )
-
-    if cmd_name == "list":
-        evs = await get_managed_events(session, from_user, today_iso=today_iso)
-        if not evs:
-            return await sender(
-                chat_id,
-                "Списков пока нет. Команда работает для штаба и для организаторов клуба (роль «Организатор» в /register), когда на события клуба кто-то записался.",
-            )
-        inline_rows = [
-            [
-                {
-                    "text": f"{tg_date_fmt(e['date'])[:5]} · {tg_cut(e['title'], 34)} · {e['going']}"
-                    + (f" (пришли {e['inside']})" if e["inside"] else ""),
-                    "callback_data": f"l:{e['id'][:60]}",
-                }
-            ]
-            for e in evs[:20]
-        ]
-        return await sender(
-            chat_id,
-            "<b>Списки участников</b>\nНажмите на событие, пришлю таблицу CSV (открывается в Excel и Google Таблицах).",
-            {"inline_keyboard": inline_rows},
-        )
-
+    # Registration step if active
     rdlg = await state_store.get(rkey)
     if rdlg and not cmd_name:
+        d_reg = json.loads(rdlg)
+        if d_reg.get("anchor_mode"):
+            return await handle_anchor_reg_step(
+                session=session,
+                chat_id=chat_id,
+                from_user=from_user,
+                d=d_reg,
+                text=text,
+                state_store=state_store,
+                send_msg_fn=sender,
+                send_api_fn=api_caller,
+            )
         return await handle_reg_step(
             chat_id,
             from_user,
-            json.loads(rdlg),
+            d_reg,
             text,
             state_store=state_store,
             send_msg_fn=sender,
         )
 
-    if cmd_name == "menu":
-        from backend.anchor_ui import create_default_navigator
-
-        nav = create_default_navigator(state_store=state_store)
-        await upsert_bot_user(session, from_user)
-        await nav.reset_history(from_user["id"], session=session)
-        return await nav.navigate(
-            session=session,
-            user_id=from_user["id"],
-            chat_id=chat_id,
-            screen_id="home",
-            payload={},
-            push_to_history=True,
-            force_new_message=True,
+    # 5W1H Idea creation step if active
+    d_raw = await state_store.get(dkey)
+    if d_raw and not cmd_name:
+        return await handle_new_dialog_step(
+            chat_id,
+            from_user,
+            json.loads(d_raw),
+            text,
+            state_store=state_store,
             send_msg_fn=sender,
+            send_api_fn=api_caller,
+            today_iso=today_iso,
+            session=session,
         )
 
-    if cmd_name in ("start", "help"):
-        await upsert_bot_user(session, from_user)
-        help_text = (
-            "<b>Sunday Open · Проекты</b>\n\n"
-            "Здесь клубы подают идеи, заполняют паспорт проекта и смотрят календарь. "
-            "Правки сначала смотрит штаб, я напишу, когда их одобрят.\n\n"
-            "/register — регистрация клуба и контакты\n"
-            "/new — подать идею прямо в чате\n"
-            "/ideas — банк идей\n"
-            "/calendar — ближайшие события\n"
-            "/remind — включить или выключить напоминания\n"
-            "/list — списки участников (организаторам)\n"
-            "/cancel — прервать подачу идеи или регистрацию"
-        )
-        return await sender(chat_id, help_text, tg_webapp_kb("Открыть портал"))
-
+    # Explicit /cancel
     if cmd_name == "cancel":
+        if rdlg:
+            d_reg = json.loads(rdlg)
+            await clean_contact_markup(chat_id, d_reg, api_caller)
         await state_store.remove(dkey)
         await state_store.remove(rkey)
         return await sender(
-            chat_id,
-            "Прервал. Подать идею: /new, регистрация: /register",
-            {"remove_keyboard": True},
+            chat_id, "Ок, отменил.", {"remove_keyboard": True}
         )
 
+    # Registration trigger (legacy command /register or /start reg)
+    if (cmd_name == "start" and cmd_arg == "reg") or cmd_name == "register":
+        return await handle_reg_start(
+            chat_id, from_user, state_store=state_store, send_msg_fn=sender
+        )
+
+    # Moderator code authorization
     if cmd_name == "mod":
         mod_code = await get_kv(session, "TG_MOD_CODE", "")
         if not cmd_arg or not mod_code or cmd_arg != mod_code:
@@ -1320,6 +1622,7 @@ async def handle_tg_message(
         )
         return await sender(chat_id, "Уведомления модератора отключены.")
 
+    # Legacy /remind command
     if cmd_name == "remind":
         cur_rem = await upsert_bot_user(session, from_user)
         next_rem = not cur_rem
@@ -1331,39 +1634,90 @@ async def handle_tg_message(
         )
         return await sender(chat_id, msg_text)
 
-    if cmd_name in ("ideas", "calendar"):
-        rows = await get_portal_rows(session)
-        if cmd_name == "ideas":
-            txt, kb = format_ideas_text(rows)
-        else:
-            txt, kb = format_calendar_text(rows, today_iso=today_iso)
-        return await sender(chat_id, txt, kb)
-
+    # Legacy /new command
     if cmd_name == "new":
         await state_store.put(
             dkey, json.dumps({"step": 0, "row": {}}), ttl=21600
         )
         return await sender(
             chat_id,
-            f"Подаём идею по 5W1H, {len(TG_STEPS)} коротких вопросов. Пропустить вопрос: «-». Прервать: /cancel\n\n<b>1/{len(TG_STEPS)}.</b> {TG_STEPS[0][1]}",
+            f"Подаём идею по 5W1H, {len(TG_STEPS)} коротких вопросов. Пропустить шаг: «-», прервать: /cancel.\n\n<b>1/{len(TG_STEPS)}.</b> {TG_STEPS[0][1]}",
         )
 
-    d_raw = await state_store.get(dkey)
-    if d_raw and not cmd_name:
-        return await handle_new_dialog_step(
-            chat_id,
-            from_user,
-            json.loads(d_raw),
-            text,
-            state_store=state_store,
-            send_msg_fn=sender,
-            today_iso=today_iso,
-        )
+    # Legacy /ideas command
+    if cmd_name == "ideas":
+        rows = await get_portal_rows(session)
+        text_out, kb = format_ideas_text(rows)
+        return await sender(chat_id, text_out, kb)
 
-    return await sender(
-        chat_id,
-        "Не понял. Подать идею: /new, список команд: /help",
-        tg_webapp_kb("Открыть портал"),
+    # Legacy /calendar command
+    if cmd_name == "calendar":
+        rows = await get_portal_rows(session)
+        text_out, kb = format_calendar_text(rows, today_iso=today_iso)
+        return await sender(chat_id, text_out, kb)
+
+    # Legacy /list command
+    if cmd_name == "list":
+        events = await get_managed_events(session, from_user, today_iso=today_iso)
+        if not events:
+            return await sender(
+                chat_id,
+                "Нет ближайших событий с регистрацией, которыми вы управляете. Убедитесь, что в /register указан ваш клуб и роль «Организатор».",
+                tg_webapp_kb("Открыть план", "tab=plan"),
+            )
+        lines = ["<b>Ваши события с регистрацией</b>", ""]
+        kb_rows = []
+        for e in events[:20]:
+            inside_part = f", вошли {e['inside']}" if e.get("inside") else ""
+            lines.append(
+                f"• {tg_ev_line(e['title'], e['date'])} — идут {e['going']}{inside_part}"
+            )
+            kb_rows.append(
+                [
+                    {
+                        "text": f"📥 {tg_date_fmt(e['date'])[:5]} {tg_cut(e['title'], 24)} ({e['going']})",
+                        "callback_data": f"l:{e['id']}",
+                    }
+                ]
+            )
+        return await sender(chat_id, "\n".join(lines), {"inline_keyboard": kb_rows})
+
+    # Default: /start, /menu, /help, or any text outside an active dialog ->
+    # Re-initialize Single Persistent Anchor Message (matching aitu-gaming-hub cmd_start & fallback_text)
+    if rdlg:
+        d_reg = json.loads(rdlg)
+        await clean_contact_markup(chat_id, d_reg, api_caller)
+    await state_store.remove(dkey)
+    await state_store.remove(rkey)
+
+    from backend.anchor_ui import create_default_navigator
+
+    nav = create_default_navigator(state_store=state_store)
+    uid = from_user["id"]
+    await upsert_bot_user(session, from_user)
+
+    # Delete previous anchor message if one exists to prevent clutter
+    old_anchor_id = await nav.get_anchor_id(uid, session=session)
+    if old_anchor_id:
+        try:
+            await api_caller(
+                "deleteMessage",
+                {"chat_id": chat_id, "message_id": int(old_anchor_id)},
+            )
+        except Exception:
+            pass
+
+    await nav.reset_history(uid, session=session)
+    return await nav.navigate(
+        session=session,
+        user_id=uid,
+        chat_id=chat_id,
+        screen_id="home",
+        payload={},
+        push_to_history=True,
+        force_new_message=True,
+        send_msg_fn=sender,
+        send_api_fn=api_caller,
     )
 
 
@@ -1384,6 +1738,7 @@ async def handle_tg_callback(
     chat_id = (msg.get("chat") or {}).get("id")
     message_id = msg.get("message_id")
     from_user = cb.get("from") or {}
+    uid = from_user.get("id")
 
     async def answer(text_str: str = "", alert: bool = False) -> Any:
         return await api_caller(
@@ -1406,12 +1761,11 @@ async def handle_tg_callback(
             },
         )
 
-    # Anchor UI LIFO navigation callbacks (nav:back, nav:home, nav:open:*, nav:stage:*, nav:card:*)
+    # 1. Anchor UI LIFO navigation callbacks (nav:back, nav:home, nav:open:*, nav:stage:*, nav:card:*)
     if data.startswith("nav:"):
         from backend.anchor_ui import create_default_navigator
 
         nav = create_default_navigator(state_store=state_store)
-        uid = from_user.get("id")
         if data == "nav:back":
             await nav.back(
                 session=session,
@@ -1479,7 +1833,258 @@ async def handle_tg_callback(
             )
             return await answer()
 
-    # Role selection in /register (g:0, g:1, g:2)
+    # 2. Onboarding Registration Wizard callbacks (auth:start_reg, auth:role:*, auth:skip_email, auth:cancel)
+    if data.startswith("auth:") or data == "act:register":
+        from backend.anchor_ui import (
+            create_default_navigator,
+            get_choose_role_screen,
+            get_club_screen,
+            get_full_name_screen,
+            get_registration_cancelled_screen,
+        )
+
+        nav = create_default_navigator(state_store=state_store)
+        rkey = f"tgr{chat_id}"
+        dkey = f"tgd{chat_id}"
+
+        if data in ("auth:start_reg", "act:register"):
+            await state_store.remove(dkey)
+            await state_store.put(
+                rkey,
+                json.dumps({"step": "role", "p": {}, "anchor_mode": True}),
+                ttl=21600,
+            )
+            await nav.render_screen(
+                session=session,
+                user_id=uid,
+                chat_id=chat_id,
+                screen=get_choose_role_screen(),
+                anchor_message_id=message_id,
+                send_msg_fn=sender,
+                send_api_fn=api_caller,
+            )
+            return await answer()
+
+        if data.startswith("auth:role:"):
+            role_name = data[len("auth:role:") :]
+            raw_d = await state_store.get(rkey)
+            d = json.loads(raw_d) if raw_d else {"p": {}, "anchor_mode": True}
+            d["p"]["role"] = role_name
+            d["step"] = "name"
+            d["anchor_mode"] = True
+            await state_store.put(rkey, json.dumps(d), ttl=21600)
+            await nav.render_screen(
+                session=session,
+                user_id=uid,
+                chat_id=chat_id,
+                screen=get_full_name_screen(role=role_name),
+                anchor_message_id=message_id,
+                send_msg_fn=sender,
+                send_api_fn=api_caller,
+            )
+            return await answer()
+
+        if data == "auth:skip_email":
+            raw_d = await state_store.get(rkey)
+            if not raw_d:
+                return await answer("Сессия истекла", True)
+            d = json.loads(raw_d)
+            d["step"] = "club"
+            await state_store.put(rkey, json.dumps(d), ttl=21600)
+            role_val = d.get("p", {}).get("role", "Участник")
+            full_name_val = f"{d.get('p', {}).get('firstName', '')} {d.get('p', {}).get('lastName', '')}".strip()
+            phone_val = d.get("p", {}).get("phone", "")
+            await nav.render_screen(
+                session=session,
+                user_id=uid,
+                chat_id=chat_id,
+                screen=get_club_screen(
+                    role=role_val, full_name=full_name_val, phone=phone_val
+                ),
+                anchor_message_id=message_id,
+                send_msg_fn=sender,
+                send_api_fn=api_caller,
+            )
+            return await answer()
+
+        if data == "auth:cancel":
+            raw_d = await state_store.get(rkey)
+            if raw_d:
+                d = json.loads(raw_d)
+                await clean_contact_markup(chat_id, d, api_caller)
+            await state_store.remove(rkey)
+            await nav.render_screen(
+                session=session,
+                user_id=uid,
+                chat_id=chat_id,
+                screen=get_registration_cancelled_screen(),
+                anchor_message_id=message_id,
+                send_msg_fn=sender,
+                send_api_fn=api_caller,
+            )
+            return await answer("Регистрация отменена")
+
+    # 3. 5W1H Idea Anchor Wizard callbacks (wiz:new_idea, wiz:use_club, wiz:date:*, wiz:skip, wiz:prev, wiz:cancel)
+    if data.startswith("wiz:") or data in ("act:new_idea", "act:skip_step", "act:cancel_dialog"):
+        from backend.anchor_ui import (
+            create_default_navigator,
+            get_wizard_confirm_screen,
+            get_wizard_step_screen,
+        )
+
+        nav = create_default_navigator(state_store=state_store)
+        dkey = f"tgd{chat_id}"
+        rkey = f"tgr{chat_id}"
+        portal_rows = await get_portal_rows(session)
+        occ = {
+            str(r["date"])
+            for r in portal_rows
+            if r.get("date") and r.get("stage") not in ("Отклонена", "Закрыт")
+        }
+
+        if data in ("wiz:new_idea", "act:new_idea"):
+            await state_store.remove(rkey)
+            contact = (
+                await session.execute(select(Contact).where(Contact.tg_id == str(uid)))
+            ).scalar_one_or_none()
+            saved_club = (contact.club or "").strip() if contact else ""
+            d = {
+                "step": 0,
+                "row": {},
+                "anchor_mode": True,
+                "user_club": saved_club,
+                "saved_club": saved_club,
+            }
+            await state_store.put(dkey, json.dumps(d), ttl=21600)
+            await nav.render_screen(
+                session=session,
+                user_id=uid,
+                chat_id=chat_id,
+                screen=get_wizard_step_screen(d, occupied_dates=occ),
+                anchor_message_id=message_id,
+                send_msg_fn=sender,
+                send_api_fn=api_caller,
+            )
+            return await answer()
+
+        if data in ("wiz:cancel", "act:cancel_dialog"):
+            await state_store.remove(dkey)
+            await nav.reset_history(uid, session=session)
+            await nav.navigate(
+                session=session,
+                user_id=uid,
+                chat_id=chat_id,
+                screen_id="home",
+                payload={},
+                push_to_history=True,
+                anchor_message_id=message_id,
+                send_msg_fn=sender,
+                send_api_fn=api_caller,
+            )
+            return await answer("Подача идеи отменена")
+
+        raw_d = await state_store.get(dkey)
+        if not raw_d:
+            return await answer("Сессия подачи идеи истекла", True)
+        d = json.loads(raw_d)
+        d["anchor_mode"] = True
+
+        if data == "wiz:prev":
+            cur_step = int(d.get("step", 0))
+            if cur_step > 0:
+                d["step"] = cur_step - 1
+                await state_store.put(dkey, json.dumps(d), ttl=21600)
+            await nav.render_screen(
+                session=session,
+                user_id=uid,
+                chat_id=chat_id,
+                screen=get_wizard_step_screen(d, occupied_dates=occ),
+                anchor_message_id=message_id,
+                send_msg_fn=sender,
+                send_api_fn=api_caller,
+            )
+            return await answer()
+
+        if data == "wiz:use_club":
+            club_val = d.get("user_club") or d.get("saved_club") or "Клуб"
+            await handle_new_dialog_step(
+                chat_id=chat_id,
+                from_user=from_user,
+                d=d,
+                text=club_val,
+                state_store=state_store,
+                send_msg_fn=sender,
+                send_api_fn=api_caller,
+                session=session,
+            )
+            return await answer(f"Клуб: {club_val}")
+
+        if data.startswith("wiz:date:"):
+            iso_val = data[len("wiz:date:") :]
+            d["row"]["date"] = iso_val
+            d["step"] = int(d.get("step", 0)) + 1
+            await state_store.put(dkey, json.dumps(d), ttl=21600)
+            if d["step"] < len(TG_STEPS):
+                await nav.render_screen(
+                    session=session,
+                    user_id=uid,
+                    chat_id=chat_id,
+                    screen=get_wizard_step_screen(d, occupied_dates=occ),
+                    anchor_message_id=message_id,
+                    send_msg_fn=sender,
+                    send_api_fn=api_caller,
+                )
+            else:
+                await nav.render_screen(
+                    session=session,
+                    user_id=uid,
+                    chat_id=chat_id,
+                    screen=get_wizard_confirm_screen(d),
+                    anchor_message_id=message_id,
+                    send_msg_fn=sender,
+                    send_api_fn=api_caller,
+                )
+            return await answer(f"Выбрана дата: {tg_date_fmt(iso_val)}")
+
+        if data in ("wiz:skip", "act:skip_step"):
+            await handle_new_dialog_step(
+                chat_id=chat_id,
+                from_user=from_user,
+                d=d,
+                text="-",
+                state_store=state_store,
+                send_msg_fn=sender,
+                send_api_fn=api_caller,
+                session=session,
+            )
+            return await answer("Шаг пропущен")
+
+    # 4. Toggle reminders inline action (act:toggle_remind)
+    if data == "act:toggle_remind":
+        from backend.anchor_ui import create_default_navigator
+
+        cur_rem = await upsert_bot_user(session, from_user)
+        next_rem = not cur_rem
+        await upsert_bot_user(session, from_user, reminders_patch=next_rem)
+        nav = create_default_navigator(state_store=state_store)
+        top = await nav.stack.peek(uid, session=session)
+        target_screen = top.get("screen_id", "home") if top else "home"
+        await nav.navigate(
+            session=session,
+            user_id=uid,
+            chat_id=chat_id,
+            screen_id=target_screen,
+            payload=(top.get("payload") or {}) if top else {},
+            push_to_history=False,
+            anchor_message_id=message_id,
+            send_msg_fn=sender,
+            send_api_fn=api_caller,
+        )
+        return await answer(
+            "🔔 Напоминания включены" if next_rem else "🔕 Напоминания выключены"
+        )
+
+    # 5. Legacy role selection in /register (g:0, g:1, g:2)
     if re.match(r"^g:\d$", data):
         role_idx = int(data[2:])
         rkey = f"tgr{chat_id}"
@@ -1497,7 +2102,7 @@ async def handle_tg_callback(
         prefix = (
             f"Сохранил. Не хватает: {', '.join(miss)}."
             if miss
-            else "✅ Готово, вы зарегистрированы."
+            else "Готово, вы зарегистрированы."
         )
         org_note = (
             "\nКак организатор вы получите список участников событий своего клуба за день до события, а также по команде /list."
@@ -1513,7 +2118,7 @@ async def handle_tg_callback(
         )
         return await answer("Сохранено")
 
-    # CSV export button in /list (l:<eventId>)
+    # 6. CSV export button in /list (l:<eventId>)
     if data.startswith("l:"):
         event_id = data[2:]
         user_id = str(from_user["id"])
@@ -1534,22 +2139,65 @@ async def handle_tg_callback(
         await doc_sender(chat_id, filename, csv_data["csv"], caption)
         return await answer("Отправил")
 
-    # /new dialog send or cancel (n:send, n:cancel)
+    # 7. Idea submission confirm or cancel (n:send, n:cancel)
     if data in ("n:cancel", "n:send"):
         dkey = f"tgd{chat_id}"
         raw_d = await state_store.get(dkey)
         if not raw_d:
-            return await answer("Заявка устарела. Начните заново: /new", True)
+            return await answer("Заявка устарела.", True)
+        d = json.loads(raw_d)
+        anchor_mode = bool(d.get("anchor_mode"))
         await state_store.remove(dkey)
+
         if data == "n:cancel":
+            if anchor_mode:
+                from backend.anchor_ui import create_default_navigator
+
+                nav = create_default_navigator(state_store=state_store)
+                await nav.reset_history(uid, session=session)
+                await nav.navigate(
+                    session=session,
+                    user_id=uid,
+                    chat_id=chat_id,
+                    screen_id="home",
+                    payload={},
+                    push_to_history=True,
+                    anchor_message_id=message_id,
+                    send_msg_fn=sender,
+                    send_api_fn=api_caller,
+                )
+                return await answer("Подача идеи отменена")
             await close_msg("Отменено.")
             return await answer()
-        d = json.loads(raw_d)
+
         out = await submit_idea_from_bot(session, from_user, d.get("row") or {})
         res = out["res"]
         if res.get("ok") is False and res.get("status") != "pending":
             await state_store.put(dkey, raw_d, ttl=21600)
             return await answer("Таблица занята, нажмите ещё раз через минуту.", True)
+
+        if anchor_mode:
+            from backend.anchor_ui import (
+                create_default_navigator,
+                get_wizard_submitted_screen,
+            )
+
+            nav = create_default_navigator(state_store=state_store)
+            await nav.render_screen(
+                session=session,
+                user_id=uid,
+                chat_id=chat_id,
+                screen=get_wizard_submitted_screen(
+                    card_id=out["id"],
+                    title=str((d.get("row") or {}).get("title") or "Без названия"),
+                    is_pending=(res.get("status") == "pending"),
+                ),
+                anchor_message_id=message_id,
+                send_msg_fn=sender,
+                send_api_fn=api_caller,
+            )
+            return await answer("Отправлено!")
+
         status_note = (
             "Отправлено в штаб. Напишу, когда решат."
             if res.get("status") == "pending"

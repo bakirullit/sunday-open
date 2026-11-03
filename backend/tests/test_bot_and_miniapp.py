@@ -635,3 +635,195 @@ async def test_anchor_ui_lifo_navigation_stack(session_maker) -> None:
         assert await nav.stack.depth(uid, session=s) == 2
         assert scr_back2 is not None
         assert scr_back2.breadcrumbs == ["🏠 Главная", "💡 Банк идей"]
+
+
+@pytest.mark.asyncio
+async def test_anchor_wizard_onboarding_and_5w1h_single_message(
+    session_maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Verify aitu-gaming-hub Single-Message Anchor Wizard + GarbageCollector:
+    1. Unregistered user sends /start -> gets club info screen with 'auth:start_reg'.
+    2. User messages are immediately deleted via deleteMessage (GarbageCollector).
+    3. Onboarding wizard ('auth:start_reg' -> 'auth:role:Организатор' -> name -> phone -> 'auth:skip_email' -> club)
+       updates the single anchor message in-place via editMessageText and switches home menu to Authorized state.
+    4. 5W1H Idea Anchor Wizard ('wiz:new_idea' -> title -> 'wiz:use_club' -> 'wiz:date:...' -> 'wiz:skip' -> 'n:send')
+       edits the single anchor message in-place and submits the idea.
+    """
+    monkeypatch.setattr(settings, "SUNDAY_MODERATION", "0")
+    monkeypatch.setattr(settings, "TG_BOT_TOKEN", "123456:TEST_TOKEN")
+
+    sends: list[tuple[Any, str, Any]] = []
+    edits: list[dict[str, Any]] = []
+    deletes: list[dict[str, Any]] = []
+
+    async def fake_send_msg(chat_id: Any, html: str, kb: Any = None, **kw: Any) -> dict[str, Any]:
+        sends.append((chat_id, html, kb))
+        return {"ok": True, "result": {"message_id": 888}}
+
+    async def fake_send_api(method: str, payload: dict[str, Any], **kw: Any) -> dict[str, Any]:
+        if method == "editMessageText":
+            edits.append(payload)
+        elif method == "deleteMessage":
+            deletes.append(payload)
+        elif method == "sendMessage":
+            return {"ok": True, "result": {"message_id": 889}}
+        return {"ok": True}
+
+    from backend import bot as bot_mod
+
+    monkeypatch.setattr(bot_mod, "send_tg_message", fake_send_msg)
+    monkeypatch.setattr(bot_mod, "send_tg_api", fake_send_api)
+
+    async with session_maker() as s:
+        async with s.begin():
+            await set_kv(s, "TG_SECRET", "wh_sec_anchor")
+
+    transport = ASGITransport(app=app)
+    user = {"id": 7007, "first_name": "Алихан", "username": "alikhan"}
+
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # 1. /start -> Unregistered Club Info Screen + GarbageCollector deletes user message_id=10
+        await client.post(
+            "/?tg=wh_sec_anchor",
+            content=json.dumps(
+                {
+                    "update_id": 7000,
+                    "message": {
+                        "message_id": 10,
+                        "from": user,
+                        "chat": {"id": 7007, "type": "private"},
+                        "text": "/start",
+                    },
+                }
+            ),
+        )
+        assert len(sends) == 1
+        assert "Пройти регистрацию" in json.dumps(sends[0][2], ensure_ascii=False)
+        assert any(d.get("message_id") == 10 for d in deletes)
+
+        # 2. Click 'auth:start_reg' -> edits anchor message 888 with role selection
+        await client.post(
+            "/?tg=wh_sec_anchor",
+            content=json.dumps(
+                {
+                    "update_id": 7001,
+                    "callback_query": {
+                        "id": "cb-1",
+                        "from": user,
+                        "message": {"message_id": 888, "chat": {"id": 7007, "type": "private"}},
+                        "data": "auth:start_reg",
+                    },
+                }
+            ),
+        )
+        assert "Выберите ваш статус" in edits[-1]["text"]
+
+        # 3. Click 'auth:role:Организатор' -> edits anchor message 888 with full name step (Шаг 1 из 4)
+        await client.post(
+            "/?tg=wh_sec_anchor",
+            content=json.dumps(
+                {
+                    "update_id": 7002,
+                    "callback_query": {
+                        "id": "cb-2",
+                        "from": user,
+                        "message": {"message_id": 888, "chat": {"id": 7007, "type": "private"}},
+                        "data": "auth:role:Организатор",
+                    },
+                }
+            ),
+        )
+        assert "Шаг 1 из 4" in edits[-1]["text"]
+
+        # 4. Send full name -> GarbageCollector deletes user message, edits anchor to Step 2 (Phone)
+        await client.post(
+            "/?tg=wh_sec_anchor",
+            content=json.dumps(
+                {
+                    "update_id": 7003,
+                    "message": {
+                        "message_id": 11,
+                        "from": user,
+                        "chat": {"id": 7007, "type": "private"},
+                        "text": "Алихан Бокейханов",
+                    },
+                }
+            ),
+        )
+        assert any(d.get("message_id") == 11 for d in deletes)
+        assert "Шаг 2 из 4" in edits[-1]["text"]
+
+        # 5. Send phone -> cleans up reply keyboard message 889, edits anchor to Step 3 (Email)
+        await client.post(
+            "/?tg=wh_sec_anchor",
+            content=json.dumps(
+                {
+                    "update_id": 7004,
+                    "message": {
+                        "message_id": 12,
+                        "from": user,
+                        "chat": {"id": 7007, "type": "private"},
+                        "text": "+77015554433",
+                    },
+                }
+            ),
+        )
+        assert any(d.get("message_id") == 889 for d in deletes)
+        assert "Шаг 3 из 4" in edits[-1]["text"]
+
+        # 6. Skip email via inline button 'auth:skip_email' -> edits anchor to Step 4 (Club)
+        await client.post(
+            "/?tg=wh_sec_anchor",
+            content=json.dumps(
+                {
+                    "update_id": 7005,
+                    "callback_query": {
+                        "id": "cb-3",
+                        "from": user,
+                        "message": {"message_id": 888, "chat": {"id": 7007, "type": "private"}},
+                        "data": "auth:skip_email",
+                    },
+                }
+            ),
+        )
+        assert "Шаг 4 из 4" in edits[-1]["text"]
+
+        # 7. Send club name -> completes registration & renders Authorized Home Menu in-place!
+        await client.post(
+            "/?tg=wh_sec_anchor",
+            content=json.dumps(
+                {
+                    "update_id": 7006,
+                    "message": {
+                        "message_id": 13,
+                        "from": user,
+                        "chat": {"id": 7007, "type": "private"},
+                        "text": "AITU Gaming",
+                    },
+                }
+            ),
+        )
+        assert "Алихан Бокейханов" in edits[-1]["text"]
+        assert "Организатор клуба" in edits[-1]["text"]
+        assert "wiz:new_idea" in json.dumps(edits[-1]["reply_markup"], ensure_ascii=False)
+
+        # 8. Start 5W1H Idea Anchor Wizard via 'wiz:new_idea'
+        await client.post(
+            "/?tg=wh_sec_anchor",
+            content=json.dumps(
+                {
+                    "update_id": 7007,
+                    "callback_query": {
+                        "id": "cb-4",
+                        "from": user,
+                        "message": {"message_id": 888, "chat": {"id": 7007, "type": "private"}},
+                        "data": "wiz:new_idea",
+                    },
+                }
+            ),
+        )
+        assert "Шаг 1 из 9" in edits[-1]["text"]
+        # Still only 1 sendMessage call in the entire session!
+        assert len(sends) == 1
+
